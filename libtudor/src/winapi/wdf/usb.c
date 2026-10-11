@@ -135,7 +135,7 @@ static void usb_if_destr(struct wdf_usb_interface *usb_if) {
 }
 
 __winfnc NTSTATUS WdfUsbTargetDeviceCreate(WDF_DRIVER_GLOBALS *globals, WDFOBJECT dev_obj, WDF_OBJECT_ATTRIBUTES *obj_attrs, WDFOBJECT *out) {
-    log_debug("DIAG: WdfUsbTargetDeviceCreate called! [dev_obj=%p]", dev_obj);
+    log_verbose("WdfUsbTargetDeviceCreate called! [dev_obj=%p]", dev_obj);
     struct winwdf_device *dev = (struct winwdf_device*) dev_obj;
     if(!wdf_get_libusb_device(dev)) {
         log_warn("Attempted to create WDF USB device for non-USB device!");
@@ -226,7 +226,7 @@ __winfnc NTSTATUS WdfUsbTargetDeviceResetPortSynchronously(WDF_DRIVER_GLOBALS *g
 WDFFUNC(WdfUsbTargetDeviceResetPortSynchronously, 214)
 
 __winfnc WDFOBJECT WdfUsbTargetDeviceGetInterface(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_dev_obj, UCHAR interface_idx) {
-    log_debug("DIAG: WdfUsbTargetDeviceGetInterface called! [interface_idx=%d]", (int) interface_idx);
+    log_verbose("WdfUsbTargetDeviceGetInterface called! [interface_idx=%d]", (int) interface_idx);
     struct wdf_usb_device *usb_dev = (struct wdf_usb_device*) usb_dev_obj;
     if(interface_idx >= usb_dev->cfg_descr->bNumInterfaces) return NULL;
 
@@ -373,7 +373,7 @@ struct transfer_req_ctx {
 
 static void pipe_transfer_callback(struct libusb_transfer *transfer) {
     struct transfer_req_ctx *ctx = (struct transfer_req_ctx*) transfer->user_data;
-    log_debug("DIAG: pipe_transfer_callback called! [ep=0x%02x status=%d actual_len=%d]", transfer->endpoint, transfer->status, transfer->actual_length);
+    log_verbose("pipe_transfer_callback called! [ep=0x%02x status=%d actual_len=%d]", transfer->endpoint, transfer->status, transfer->actual_length);
 
     //Handle status
     if(transfer->status == LIBUSB_TRANSFER_CANCELLED) {
@@ -427,7 +427,7 @@ static void pipe_transfer_callback(struct libusb_transfer *transfer) {
 }
 
 static NTSTATUS usb_transfer_start(struct winwdf_request *req, struct transfer_req_ctx *ctx, WDFOBJECT target, int timeout, void **data) {
-    log_debug("DIAG: usb_transfer_start called! [ep=0x%02x len=%d timeout=%d]", ctx->transfer ? ctx->transfer->endpoint : 0, (int) ctx->buf_len, timeout);
+    log_verbose("usb_transfer_start called! [ep=0x%02x len=%d timeout=%d]", ctx->transfer ? ctx->transfer->endpoint : 0, (int) ctx->buf_len, timeout);
     *data = NULL;
 
     //Initialize remaining transfer fields
@@ -469,7 +469,7 @@ static void usb_transfer_cleanup(struct winwdf_request *req, struct transfer_req
 }
 
 __winfnc NTSTATUS WdfUsbTargetDeviceFormatRequestForControlTransfer(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_dev_obj, WDFOBJECT req_obj, WDF_USB_CONTROL_SETUP_PACKET *packet, WDFOBJECT mem_obj, WDFMEMORY_OFFSET *mem_off) {
-    log_debug("DIAG: WdfUsbTargetDeviceFormatRequestForControlTransfer called!");
+    log_verbose("WdfUsbTargetDeviceFormatRequestForControlTransfer called!");
     struct wdf_usb_device *usb_dev = (struct wdf_usb_device*) usb_dev_obj;
     struct wdf_memory *mem = (struct wdf_memory*) mem_obj;
     struct winwdf_request *req = (struct winwdf_request*) req_obj;
@@ -507,7 +507,7 @@ WDFFUNC(WdfUsbTargetDeviceFormatRequestForControlTransfer, 213)
 //(wdf_usb_pipe_format_request_for_{read,write}_raw) used by com_activate.c's COM USB target
 //facades, whose IWDFMemory objects aren't struct wdf_memory (see transfer_req_ctx's own comment).
 static NTSTATUS usb_pipe_format_request_for_read_core(struct wdf_usb_pipe *usb_pipe, struct winwdf_request *req, void *buf, size_t buf_len, WDFOBJECT mem_obj_ref) {
-    log_debug("DIAG: usb_pipe_format_request_for_read_core called! [ep=0x%02x len=%zu]", usb_pipe->libusb_ep->bEndpointAddress, buf_len);
+    log_verbose("usb_pipe_format_request_for_read_core called! [ep=0x%02x len=%zu]", usb_pipe->libusb_ep->bEndpointAddress, buf_len);
 
     //Check the endpoint direction
     if((usb_pipe->libusb_ep->bEndpointAddress & 0b10000000) != LIBUSB_ENDPOINT_IN) {
@@ -551,7 +551,7 @@ static NTSTATUS usb_pipe_format_request_for_read_core(struct wdf_usb_pipe *usb_p
 }
 
 static NTSTATUS usb_pipe_format_request_for_write_core(struct wdf_usb_pipe *usb_pipe, struct winwdf_request *req, void *buf, size_t buf_len, WDFOBJECT mem_obj_ref) {
-    log_debug("DIAG: usb_pipe_format_request_for_write_core called! [ep=0x%02x len=%zu]", usb_pipe->libusb_ep->bEndpointAddress, buf_len);
+    log_verbose("usb_pipe_format_request_for_write_core called! [ep=0x%02x len=%zu]", usb_pipe->libusb_ep->bEndpointAddress, buf_len);
 
     //Check the endpoint direction
     if((usb_pipe->libusb_ep->bEndpointAddress & 0b10000000) != LIBUSB_ENDPOINT_OUT) {

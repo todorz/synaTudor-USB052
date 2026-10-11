@@ -4,13 +4,6 @@
 
 typedef DWORD __winfnc THREAD_START_ROUTINE(void *param);
 
-//Implemented in tudor/driver.c - lets driver-specific code inspect/patch a thread's context
-//right before it starts running, for the one specific known thread whose real work is gated on
-//state this bridge never otherwise constructs (see tudor_hook_thread_create's own comment).
-//Declared here directly (rather than pulling in tudor/internal.h) since this is a generic Win32
-//API implementation that shouldn't otherwise depend on the tudor-specific layer above it.
-void tudor_hook_thread_create(void *start_proc, void *param);
-
 #define CREATE_SUSPENDED 0x00000004
 
 struct win_thread {
@@ -99,8 +92,6 @@ __winfnc HANDLE CreateThread(void *security_attrs, SIZE_T stack_size, THREAD_STA
     thread->start_module = winmodule_get_cur();
     thread->start_proc = start_proc;
     thread->start_param = param;
-
-    tudor_hook_thread_create((void*) start_proc, param);
 
     thread->handle = winhandle_create(thread, (winhandle_destr_fnc*) thread_destr);
 

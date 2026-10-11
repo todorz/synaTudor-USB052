@@ -80,7 +80,5 @@ NTSTATUS tudor_com_add_device(HANDLE reg_key, libusb_device_handle *usb_dev, str
 void tudor_com_remove_device(void);
 extern bool tudor_using_com_activation;
 
-void tudor_reset_ctx100(void);
-void tudor_reset_ctx168(void);
 
 #endif

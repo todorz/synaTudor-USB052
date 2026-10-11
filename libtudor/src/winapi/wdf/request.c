@@ -333,7 +333,6 @@ __winfnc NTSTATUS WdfRequestCreate(WDF_DRIVER_GLOBALS *globals, WDF_OBJECT_ATTRI
 WDFFUNC(WdfRequestCreate, 148)
 
 __winfnc NTSTATUS WdfRequestMarkCancelable(WDF_DRIVER_GLOBALS *globals, WDFOBJECT req_obj, WDF_REQUEST_CANCEL_FNC *cancel_fnc) {
-    log_debug("DIAG: WdfRequestMarkCancelable req=%p", req_obj);
     struct winwdf_request *req = (struct winwdf_request*) req_obj;
 
     NTSTATUS status = WINERR_SET_CODE;
@@ -363,7 +362,7 @@ __winfnc NTSTATUS WdfRequestUnmarkCancelable(WDF_DRIVER_GLOBALS *globals, WDFOBJ
 WDFFUNC(WdfRequestUnmarkCancelable, 156)
 
 __winfnc BOOLEAN WdfRequestSend(WDF_DRIVER_GLOBALS *globals, WDFOBJECT req_obj, WDFOBJECT target, WDF_REQUEST_SEND_OPTIONS *opts) {
-    log_debug("DIAG: WdfRequestSend req=%p target=%p", req_obj, target);
+    log_verbose("WdfRequestSend req=%p target=%p", req_obj, target);
     struct winwdf_request *req = (struct winwdf_request*) req_obj;
 
     //Determine the timeout
@@ -416,7 +415,7 @@ __winfnc NTSTATUS WdfRequestGetStatus(WDF_DRIVER_GLOBALS *globals, WDFOBJECT req
 WDFFUNC(WdfRequestGetStatus, 153)
 
 __winfnc WDFOBJECT WdfRequestGetIoQueue(WDF_DRIVER_GLOBALS *globals, WDFOBJECT req_obj) {
-    log_debug("DIAG: WdfRequestGetIoQueue req=%p", req_obj);
+    log_verbose("WdfRequestGetIoQueue req=%p", req_obj);
     struct winwdf_request *req = (struct winwdf_request*) req_obj;
 
     WDFOBJECT queue;
@@ -513,7 +512,6 @@ __winfnc void WdfRequestSetInformation(WDF_DRIVER_GLOBALS *globals, WDFOBJECT re
 WDFFUNC(WdfRequestSetInformation, 170)
 
 __winfnc void WdfRequestComplete(WDF_DRIVER_GLOBALS *globals, WDFOBJECT req_obj, NTSTATUS status) {
-    log_debug("DIAG: WdfRequestComplete(flat) req=%p status=0x%x", req_obj, status);
     struct winwdf_request *req = (struct winwdf_request*) req_obj;
     wdf_complete_request(req, status, NULL);
 }

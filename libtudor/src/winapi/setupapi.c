@@ -166,7 +166,7 @@ __winfnc HANDLE CreateFileA(const char *name, DWORD access, DWORD share_mode, vo
     //here made winhandle_destroy free/corrupt libusb's own device handle (libusb_close/libusb_exit
     //then aborted on a corrupted mutex). No destructor - the libusb device is owned by our caller.
     HANDLE handle = winhandle_create(usb_dev, NULL);
-    log_warn("CreateFileA: opened fake WinUsb device path, handle=%p", (void*) handle);
+    log_debug("CreateFileA: opened fake WinUsb device path, handle=%p", (void*) handle);
     return handle;
 }
 WINAPI(CreateFileA)
@@ -188,7 +188,7 @@ __winfnc HANDLE CreateFileW(const char16_t *wname, DWORD access, DWORD share_mod
         return INVALID_HANDLE_VALUE_RAW;
     }
     HANDLE handle = winhandle_create(usb_dev, NULL); //See CreateFileA
-    log_warn("CreateFileW: opened fake WinUsb device path, handle=%p", (void*) handle);
+    log_debug("CreateFileW: opened fake WinUsb device path, handle=%p", (void*) handle);
     return handle;
 }
 WINAPI(CreateFileW)

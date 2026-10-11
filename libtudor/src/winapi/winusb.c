@@ -96,7 +96,7 @@ __winfnc BOOL WinUsb_Initialize(HANDLE DeviceHandle, void **InterfaceHandle) {
     }
     libusb_free_config_descriptor(cfg);
 
-    log_warn("WinUsb_Initialize: claimed interface %d, %d pipes", wu->interface_number, wu->num_pipes);
+    log_debug("WinUsb_Initialize: claimed interface %d, %d pipes", wu->interface_number, wu->num_pipes);
     *InterfaceHandle = wu;
     winerr_clear();
     return TRUE;
@@ -202,8 +202,10 @@ struct winusb_async_xfer {
 static pthread_mutex_t g_async_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct winusb_async_xfer *g_async_head = NULL;
 
+//Opt-in (TUDOR_LOG_USB_DATA) even at verbose log level - this is raw sensor traffic, which shouldn't
+//end up in e.g. the system journal by default.
 static void winusb_log_data(const UCHAR *buf, int len) {
-    if(LOG_LEVEL > LOG_VERBOSE || len <= 0) return;
+    if(LOG_LEVEL > LOG_VERBOSE || len <= 0 || !getenv("TUDOR_LOG_USB_DATA")) return;
     char hex[2*64+4];
     int n = len < 64 ? len : 64;
     for(int i = 0; i < n; i++) sprintf(hex + 2*i, "%02x", buf[i]);

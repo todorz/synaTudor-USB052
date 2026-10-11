@@ -24,7 +24,8 @@ export, "Found match: identity index=1 finger=1", "VERIFICATION SUCCESS",
 See the last sections of this file ("The real driver now initializes the
 StartCapture context by itself" onward) for what fixed it. Most of the
 history below documents workarounds for state the driver now sets up itself.
-Those workarounds are now disabled by default (`TUDOR_LEGACY_CTX_PATCH`).
+Those workarounds have since been removed from the code entirely (see "Cleanup"
+at the end). The sections below describe code that no longer exists.
 
 Also verified, in a fresh process loading the saved data store (so
 persistence works): identify with the enrolled finger matched, identify with
@@ -3263,3 +3264,27 @@ Install note: copying a build-tree `tudor_host` into `/sbin/tudor` doesn't
 work, because its RUNPATH points at the build directory ("libtudor.so: cannot
 open shared object file"). Use `sudo meson install -C build --no-rebuild`, and
 configure the build dir with the same meson that root uses.
+
+### Cleanup: all driver workarounds removed
+
+With the shim fixed, none of the driver-specific workarounds are needed any
+more. Removed:
+- All of `driver.c`'s patch machinery: the BUSY->READY status byte patch
+  (`0x19778`), the `0x4a11c`/`0x4a12a` NOPs, `patch_device_context`, the fake
+  `field_0x100`/`field_0x1b8`/quine objects, the `CreateThread` hook,
+  `tudor_reset_ctx100`, and `tudor_reset_ctx168` (clearing `ctx+0x168` on
+  completion).
+- The `EngineContext+0x8c = 1` write in `tudor_open` (the field is 0 before it
+  and capture still works).
+- The warm-up capture, the devctrl watchdog (`TUDOR_WATCHDOG_SEC`), and the
+  "BUSY at open is non-fatal" tolerance (the sensor now reports READY).
+
+Each was first disabled individually and verified (open → status READY →
+capture armed → cancel → clean exit), then all were removed together and
+re-verified with real touches.
+
+Logging: the `DIAG:` messages were removed (per-request noise) or turned into
+plain `log_verbose`. Unimplemented COM slot calls (all known power-management
+no-ops) log at debug instead of warning level. USB payload hex dumps now also
+need `TUDOR_LOG_USB_DATA=1`, so raw sensor traffic doesn't end up in the
+journal.

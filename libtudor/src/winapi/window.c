@@ -293,7 +293,7 @@ WINAPI(PostQuitMessage)
 __winfnc BOOL PostThreadMessageW(DWORD thread_id, UINT msg, WPARAM wparam, LPARAM lparam) {
     struct msg_queue *queue = thread_id == win_get_thread_id() ? get_cur_queue() : find_thread_queue(thread_id);
     if(!queue) {
-        log_warn("PostThreadMessageW: thread %u has no message queue", (unsigned) thread_id);
+        log_debug("PostThreadMessageW: thread %u has no message queue", (unsigned) thread_id);
         winerr_set_code(ERROR_INVALID_THREAD_ID);
         return FALSE;
     }

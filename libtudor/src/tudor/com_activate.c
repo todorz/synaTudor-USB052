@@ -176,7 +176,7 @@ static const char *g_stub_iface_name;
 //own explicit, real override instead (see device_obj's vtable setup in com_create_device) rather
 //than changing this shared default.
 static void *com_generic_stub_impl(int slot, void *self, void *a, void *a2, void *a3, void *a4, void *a5) {
-    log_warn("Unimplemented %s-ish COM vtable slot #%d called! [self=%p args: %p %p %p %p %p]", g_stub_iface_name, slot, self, a, a2, a3, a4, a5);
+    log_debug("Unimplemented %s-ish COM vtable slot #%d called! [self=%p args: %p %p %p %p %p]", g_stub_iface_name, slot, self, a, a2, a3, a4, a5);
     return 0; //S_OK
 }
 
@@ -264,7 +264,6 @@ __winfnc static size_t com_memory_get_size(struct com_obj *self) {
 }
 __winfnc static void *com_memory_get_data_buffer(struct com_obj *self, size_t *out_size) {
     struct com_memory_data *mem = (struct com_memory_data*) self->user_data;
-    log_debug("DIAG: com_memory_get_data_buffer self=%p buf=%p size=0x%zx", self, mem->buf, mem->size);
     if(out_size) *out_size = mem->size;
     return mem->buf;
 }
@@ -322,7 +321,7 @@ __winfnc static void com_request_cancel_trampoline(WDFOBJECT req_obj) {
     if(rd) rd->cancelled = true;
     cant_fail_ret(pthread_mutex_unlock(&g_cancel_lock));
 
-    log_debug("DIAG: devctrl request %p cancelled, driver cancel callback %p", req_obj, cb);
+    log_verbose("devctrl request %p cancelled, driver cancel callback %p", req_obj, cb);
     if(cb) ((com_oncancel_fnc) (*(void***) cb)[3])(cb, rd->facade);
 }
 
@@ -342,7 +341,7 @@ static void com_cancel_map_set(struct com_request_data *rd) {
 
 __winfnc static HRESULT com_request_mark_cancelable(struct com_obj *self, void *cancel_cb) {
     struct com_request_data *rd = (struct com_request_data*) self->user_data;
-    log_debug("DIAG: com_request_mark_cancelable self=%p req=%p cb=%p code=0x%x", self, rd->req, cancel_cb, rd->code);
+    log_verbose("com_request_mark_cancelable self=%p req=%p cb=%p code=0x%x", self, rd->req, cancel_cb, rd->code);
     cant_fail_ret(pthread_mutex_lock(&g_cancel_lock));
     rd->cancel_cb = cancel_cb;
     cant_fail_ret(pthread_mutex_unlock(&g_cancel_lock));
@@ -358,7 +357,7 @@ __winfnc static HRESULT com_request_unmark_cancelable(struct com_obj *self) {
     rd->cancel_cb = NULL;
     bool cancelled = rd->cancelled;
     cant_fail_ret(pthread_mutex_unlock(&g_cancel_lock));
-    log_debug("DIAG: com_request_unmark_cancelable self=%p req=%p cancelled=%d", self, rd->req, cancelled);
+    log_verbose("com_request_unmark_cancelable self=%p req=%p cancelled=%d", self, rd->req, cancelled);
     //Real UMDF: HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) if OnCancel already ran / is running
     return cancelled ? (HRESULT) 0x800703E3 : 0;
 }
@@ -389,7 +388,6 @@ __winfnc static void *com_request_get_output_memory(struct com_obj *self, struct
     struct com_request_data *rd = (struct com_request_data*) self->user_data;
     const void *out_buf; size_t out_size;
     winwdf_get_request_info(rd->req, NULL, NULL, NULL, &out_buf, &out_size, NULL);
-    log_debug("DIAG: com_request_get_output_memory self=%p req=%p out_buf=%p out_size=0x%zx out=%p", self, rd->req, out_buf, out_size, (void*) out);
     *out = make_com_memory_obj_or_scratch(out_buf, out_size);
     return 0;
 }
@@ -397,31 +395,26 @@ __winfnc static void *com_request_get_input_memory(struct com_obj *self, struct 
     struct com_request_data *rd = (struct com_request_data*) self->user_data;
     const void *in_buf; size_t in_size;
     winwdf_get_request_info(rd->req, NULL, &in_buf, &in_size, NULL, NULL, NULL);
-    log_debug("DIAG: com_request_get_input_memory self=%p req=%p in_buf=%p in_size=0x%zx out=%p", self, rd->req, in_buf, in_size, (void*) out);
     *out = make_com_memory_obj_or_scratch(in_buf, in_size);
     return 0;
 }
 __winfnc static void *com_request_set_information(struct com_obj *self, ULONG_PTR info) {
     struct com_request_data *rd = (struct com_request_data*) self->user_data;
-    log_debug("DIAG: com_request_set_information self=%p req=%p info=0x%lx code=0x%x", self, rd->req, info, rd->code);
+    log_verbose("com_request_set_information self=%p req=%p info=0x%lx code=0x%x", self, rd->req, info, rd->code);
     WdfRequestSetInformation(NULL, (WDFOBJECT) rd->req, info);
     return 0;
 }
-//See FINDINGS.md's 0x8009800B section: clearing ctx->field_0x168 here, right as a devctrl request
-//actually completes, is the untried variant of that fix (tudor_reset_ctx168, driver.c).
 __winfnc static void *com_request_complete(struct com_obj *self, HRESULT status) {
     struct com_request_data *rd = (struct com_request_data*) self->user_data;
-    log_debug("DIAG: com_request_complete self=%p req=%p status=0x%x code=0x%x", self, rd->req, status, rd->code);
+    log_verbose("com_request_complete self=%p req=%p status=0x%x code=0x%x", self, rd->req, status, rd->code);
     WdfRequestComplete(NULL, (WDFOBJECT) rd->req, (NTSTATUS) status);
-    tudor_reset_ctx168();
     return 0;
 }
 __winfnc static void *com_request_complete_with_information(struct com_obj *self, HRESULT status, size_t info) {
     struct com_request_data *rd = (struct com_request_data*) self->user_data;
-    log_debug("DIAG: com_request_complete_with_information self=%p req=%p status=0x%x info=0x%zx code=0x%x", self, rd->req, status, info, rd->code);
+    log_verbose("com_request_complete_with_information self=%p req=%p status=0x%x info=0x%zx code=0x%x", self, rd->req, status, info, rd->code);
     WdfRequestSetInformation(NULL, (WDFOBJECT) rd->req, info);
     WdfRequestComplete(NULL, (WDFOBJECT) rd->req, (NTSTATUS) status);
-    tudor_reset_ctx168();
     return 0;
 }
 //IWDFIoRequest::Send (slot 23, verified against wudfddi.h's raw flattened vtable struct) - needed
@@ -433,7 +426,7 @@ __winfnc static void *com_request_complete_with_information(struct com_obj *self
 //implementation.
 __winfnc static HRESULT com_request_send(struct com_obj *self, void *io_target, ULONG flags, LONGLONG timeout) {
     struct com_request_data *rd = (struct com_request_data*) self->user_data;
-    log_debug("DIAG: com_request_send self=%p req=%p io_target=%p flags=0x%x", self, rd->req, io_target, flags);
+    log_verbose("com_request_send self=%p req=%p io_target=%p flags=0x%x", self, rd->req, io_target, flags);
     wdf_start_request(rd->req, NULL, -1);
     return 0; //S_OK
 }
@@ -499,7 +492,7 @@ __winfnc static void com_queue_evt_io_device_control(WDFOBJECT queue_obj, WDFOBJ
 //facade (same pattern as com_create_interrupt) so a caller at least gets a valid, safely-callable
 //object instead of garbage; every method on it still just logs and returns S_OK until identified.
 __winfnc static void com_get_default_io_target(struct com_obj *self, struct com_obj **out) {
-    log_debug("DIAG: com_get_default_io_target ENTER self=%p", self);
+    log_verbose("com_get_default_io_target ENTER self=%p", self);
     static struct com_obj *io_target_facade = NULL;
     if(!io_target_facade) {
         io_target_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
@@ -529,7 +522,7 @@ struct propvariant { uint16_t vt, wReserved1, wReserved2, wReserved3; union { ui
 
 __winfnc static HRESULT com_propstore_get_named_value(struct com_obj *self, const char16_t *name, struct propvariant *pv) {
     char *cname = name ? winstr_to_str(name) : NULL;
-    log_debug("DIAG: com_propstore_get_named_value self=%p name='%s' -> not found (VT_EMPTY)", self, cname ? cname : "(null)");
+    log_verbose("com_propstore_get_named_value self=%p name='%s' -> not found (VT_EMPTY)", self, cname ? cname : "(null)");
     free(cname);
     if(!pv) return (HRESULT) 0x80070057; /* E_INVALIDARG */
     *pv = (struct propvariant) {0}; /* VT_EMPTY */
@@ -544,7 +537,7 @@ __winfnc static HRESULT com_propstore_get_named_value(struct com_obj *self, cons
 //real facade (same pattern as com_get_default_io_target) so that call lands on real code instead
 //of undefined behavior over garbage memory.
 __winfnc static HRESULT com_retrieve_device_property_store(struct com_obj *self, const char16_t *service_name, ULONG flags, struct com_obj **out_store, ULONG *out_disposition) {
-    log_debug("DIAG: com_retrieve_device_property_store ENTER self=%p flags=0x%lx", self, (unsigned long) flags);
+    log_verbose("com_retrieve_device_property_store ENTER self=%p flags=0x%lx", self, (unsigned long) flags);
     static struct com_obj *prop_store_facade = NULL;
     if(!prop_store_facade) {
         prop_store_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
@@ -568,7 +561,7 @@ __winfnc static HRESULT com_retrieve_device_property_store(struct com_obj *self,
 //(a specific subkey/root), which this project doesn't distinguish since every query answers
 //VT_EMPTY regardless of which store it's nominally for.
 __winfnc static HRESULT com_property_store_factory_retrieve(struct com_obj *self, void *root_specifier, ULONG flags, ULONG desired_access, const char16_t *subkey_path, struct com_obj **out_store, ULONG *out_disposition) {
-    log_debug("DIAG: com_property_store_factory_retrieve ENTER self=%p flags=0x%lx access=0x%lx", self, (unsigned long) flags, (unsigned long) desired_access);
+    log_verbose("com_property_store_factory_retrieve ENTER self=%p flags=0x%lx access=0x%lx", self, (unsigned long) flags, (unsigned long) desired_access);
     static struct com_obj *prop_store_factory_facade = NULL;
     if(!prop_store_factory_facade) {
         prop_store_factory_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
@@ -608,7 +601,7 @@ __winfnc static HRESULT com_retrieve_device_instance_id(struct com_obj *self, ch
     if(!wid) wid = winstr_from_str(FAKE_WDF_DEVICE_INSTANCE_ID);
     int full_len = winstr_len(wid) + 1;
 
-    log_debug("DIAG: com_retrieve_device_instance_id ENTER self=%p out_id=%p *out_len=%u", self, out_id, out_len ? *out_len : 0);
+    log_verbose("com_retrieve_device_instance_id ENTER self=%p out_id=%p *out_len=%u", self, out_id, out_len ? *out_len : 0);
     if(!out_len) return (HRESULT) 0x80070057; /* E_INVALIDARG */
 
     if(!out_id) {
@@ -652,7 +645,7 @@ __winfnc static HRESULT com_retrieve_device_name(struct com_obj *self, char16_t 
     if(!wname) wname = winstr_from_str(FAKE_WDF_DEVICE_NAME);
     int full_len = winstr_len(wname) + 1;
 
-    log_debug("DIAG: com_retrieve_device_name ENTER self=%p out_name=%p *out_len=%u", self, out_name, out_len ? *out_len : 0);
+    log_verbose("com_retrieve_device_name ENTER self=%p out_name=%p *out_len=%u", self, out_name, out_len ? *out_len : 0);
     if(!out_len) return (HRESULT) 0x80070057; /* E_INVALIDARG */
 
     if(!out_name) {
@@ -690,7 +683,6 @@ __winfnc static HRESULT com_map_io_space(struct com_obj *self, uint64_t phys_add
 }
 
 __winfnc static void *com_create_io_queue(struct com_obj *self, void *callback_iface, BOOL default_queue, ULONG dispatch_type, BOOL power_managed, BOOL allow_zero_len, struct com_obj **out) {
-    log_debug("DIAG: com_create_io_queue ENTER self=%p callback_iface=%p dispatch_type=%u", self, callback_iface, dispatch_type);
     struct winwdf_device *device = (struct winwdf_device*) self->user_data;
 
     //QueryInterface the driver's own callback object for IQueueCallbackDeviceIoControl - a real
@@ -700,9 +692,9 @@ __winfnc static void *com_create_io_queue(struct com_obj *self, void *callback_i
         const GUID iid_devctrl_cb = DEFINE_GUID(c5411408, 0f1e, 4ed6, a412, 36dd15eee707);
         void **cb_vtable = *(void***) callback_iface;
         void *qi_result = ((com_raw_qi_fnc) cb_vtable[0])(callback_iface, &iid_devctrl_cb, &devctrl_callback);
-        log_debug("DIAG: com_create_io_queue QI for IQueueCallbackDeviceIoControl: result=%p devctrl_callback=%p", qi_result, devctrl_callback);
+        log_verbose("com_create_io_queue QI for IQueueCallbackDeviceIoControl: result=%p devctrl_callback=%p", qi_result, devctrl_callback);
     } else {
-        log_debug("DIAG: com_create_io_queue has NO callback_iface at all!");
+        log_verbose("com_create_io_queue has NO callback_iface at all!");
     }
 
     WDF_IO_QUEUE_CONFIG config = {0};
@@ -716,7 +708,7 @@ __winfnc static void *com_create_io_queue(struct com_obj *self, void *callback_i
     WDF_DRIVER_GLOBALS globals = { .Driver = wdf_device_get_driver(device) };
     WDFOBJECT raw_queue;
     NTSTATUS status = WdfIoQueueCreate(&globals, (WDFOBJECT) device, &config, NULL, &raw_queue);
-    log_debug("DIAG: com_create_io_queue WdfIoQueueCreate status=0x%x raw_queue=%p", status, (void*) raw_queue);
+    log_verbose("com_create_io_queue WdfIoQueueCreate status=0x%x raw_queue=%p", status, (void*) raw_queue);
     if(status != 0) return (void*) (intptr_t) status;
 
     struct com_obj *queue_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
@@ -724,7 +716,6 @@ __winfnc static void *com_create_io_queue(struct com_obj *self, void *callback_i
     wdf_queue_set_com_bridge((struct winwdf_queue*) raw_queue, devctrl_callback, queue_facade);
 
     *out = queue_facade;
-    log_debug("DIAG: com_create_io_queue EXIT queue_facade=%p", queue_facade);
     return (void*) (intptr_t) status;
 }
 
@@ -742,12 +733,9 @@ struct com_interrupt_data {
 };
 
 __winfnc static void com_interrupt_acquire_lock(struct com_obj *self) {
-    log_debug("DIAG: com_interrupt_acquire_lock ENTER self=%p", self);
     cant_fail_ret(pthread_mutex_lock(&((struct com_interrupt_data*) self->user_data)->lock));
-    log_debug("DIAG: com_interrupt_acquire_lock GOT self=%p", self);
 }
 __winfnc static void com_interrupt_release_lock(struct com_obj *self) {
-    log_debug("DIAG: com_interrupt_release_lock self=%p", self);
     cant_fail_ret(pthread_mutex_unlock(&((struct com_interrupt_data*) self->user_data)->lock));
 }
 __winfnc static void com_interrupt_enable(struct com_obj *self) {}
@@ -770,12 +758,11 @@ __winfnc static BOOLEAN com_interrupt_queue_workitem_for_isr(struct com_obj *sel
 //forced timeout.
 __winfnc static BOOLEAN com_interrupt_try_acquire_interrupt_lock(struct com_obj *self) {
     BOOLEAN got = pthread_mutex_trylock(&((struct com_interrupt_data*) self->user_data)->lock) == 0;
-    log_debug("DIAG: com_interrupt_try_acquire_interrupt_lock self=%p got=%d", self, got);
     return got;
 }
 
 __winfnc static void *com_create_interrupt(struct com_obj *self, void *config, struct com_obj **out) {
-    log_debug("DIAG: com_create_interrupt ENTER self=%p", self);
+    log_verbose("com_create_interrupt ENTER self=%p", self);
     struct com_interrupt_data *data = (struct com_interrupt_data*) malloc(sizeof(struct com_interrupt_data));
     cant_fail_ret(pthread_mutex_init(&data->lock, NULL));
     data->device_obj = self;
@@ -828,7 +815,7 @@ __winfnc static HRESULT com_usb_pipe_format_request_for_read(struct com_obj *sel
     size_t buf_len = mem->size;
     if(mem_off) { buf += mem_off->BufferOffset; buf_len = mem_off->BufferLength; }
 
-    log_debug("DIAG: com_usb_pipe_format_request_for_read self=%p req=%p buf=%p len=0x%zx", self, rd->req, (void*) buf, buf_len);
+    log_verbose("com_usb_pipe_format_request_for_read self=%p req=%p buf=%p len=0x%zx", self, rd->req, (void*) buf, buf_len);
     NTSTATUS status = wdf_usb_pipe_format_request_for_read_raw(pipe_data->usb_pipe, rd->req, buf, buf_len);
     return (HRESULT) (intptr_t) status; //STATUS_SUCCESS (0) doubles as S_OK
 }
@@ -841,7 +828,7 @@ __winfnc static HRESULT com_usb_pipe_format_request_for_write(struct com_obj *se
     size_t buf_len = mem->size;
     if(mem_off) { buf += mem_off->BufferOffset; buf_len = mem_off->BufferLength; }
 
-    log_debug("DIAG: com_usb_pipe_format_request_for_write self=%p req=%p buf=%p len=0x%zx", self, rd->req, (void*) buf, buf_len);
+    log_verbose("com_usb_pipe_format_request_for_write self=%p req=%p buf=%p len=0x%zx", self, rd->req, (void*) buf, buf_len);
     NTSTATUS status = wdf_usb_pipe_format_request_for_write_raw(pipe_data->usb_pipe, rd->req, buf, buf_len);
     return (HRESULT) (intptr_t) status;
 }
@@ -871,7 +858,7 @@ __winfnc static HRESULT com_usb_interface_retrieve_pipe(struct com_obj *self, UC
 
     WDF_USB_PIPE_INFORMATION info = {0};
     WDFOBJECT pipe_obj = WdfUsbInterfaceGetConfiguredPipe(NULL, (WDFOBJECT) usb_if, pipe_idx, &info);
-    log_debug("DIAG: com_usb_interface_retrieve_pipe self=%p pipe_idx=%d pipe_obj=%p", self, (int) pipe_idx, (void*) pipe_obj);
+    log_verbose("com_usb_interface_retrieve_pipe self=%p pipe_idx=%d pipe_obj=%p", self, (int) pipe_idx, (void*) pipe_obj);
     if(!pipe_obj) return (HRESULT) 0x80070057; /* E_INVALIDARG */
 
     struct com_usb_pipe_data *pipe_data = (struct com_usb_pipe_data*) malloc(sizeof(struct com_usb_pipe_data));
@@ -898,7 +885,7 @@ __winfnc static HRESULT com_usb_device_retrieve_interface(struct com_obj *self, 
     struct wdf_usb_device *usb_dev = (struct wdf_usb_device*) self->user_data;
 
     WDFOBJECT if_obj = WdfUsbTargetDeviceGetInterface(NULL, (WDFOBJECT) usb_dev, idx);
-    log_debug("DIAG: com_usb_device_retrieve_interface self=%p idx=%d if_obj=%p", self, (int) idx, (void*) if_obj);
+    log_verbose("com_usb_device_retrieve_interface self=%p idx=%d if_obj=%p", self, (int) idx, (void*) if_obj);
     if(!if_obj) return (HRESULT) 0x80070057; /* E_INVALIDARG */
 
     struct com_obj *if_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
@@ -915,7 +902,7 @@ __winfnc static HRESULT com_usb_factory_create_device(struct com_obj *self, stru
     WDF_DRIVER_GLOBALS globals = { .Driver = wdf_device_get_driver(device) };
     WDFOBJECT usb_dev_obj;
     NTSTATUS status = WdfUsbTargetDeviceCreate(&globals, (WDFOBJECT) device, NULL, &usb_dev_obj);
-    log_debug("DIAG: com_usb_factory_create_device self=%p status=0x%x usb_dev_obj=%p", self, status, (void*) usb_dev_obj);
+    log_verbose("com_usb_factory_create_device self=%p status=0x%x usb_dev_obj=%p", self, status, (void*) usb_dev_obj);
     if(status != 0) return (HRESULT) (intptr_t) status;
 
     struct com_obj *dev_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
@@ -933,7 +920,7 @@ static struct com_obj *get_usb_target_factory_facade(struct winwdf_device *devic
         factory_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
         make_com_obj(factory_facade, device);
         factory_facade->vtable[3] = com_usb_factory_create_device; //IWDFUsbTargetFactory::CreateUsbTargetDevice
-        log_debug("DIAG: created IWDFUsbTargetFactory facade %p for device %p", factory_facade, device);
+        log_verbose("created IWDFUsbTargetFactory facade %p for device %p", factory_facade, device);
     }
     return factory_facade;
 }
@@ -954,7 +941,7 @@ static struct com_obj *get_usb_target_factory_facade(struct winwdf_device *devic
 //no dispatch tracking for are silently accepted as a no-op rather than rejected, since our
 //simplified WDF file model has no equivalent concept for most of them.
 __winfnc static void *com_configure_request_dispatching(struct com_obj *self, struct com_obj *queue_facade, ULONG req_type, BOOL forward) {
-    log_debug("DIAG: com_configure_request_dispatching ENTER self=%p req_type=%u", self, req_type);
+    log_verbose("com_configure_request_dispatching ENTER self=%p req_type=%u", self, req_type);
     struct winwdf_device *device = (struct winwdf_device*) self->user_data;
     if(!queue_facade) return 0;
     WDFOBJECT raw_queue = (WDFOBJECT) queue_facade->user_data;

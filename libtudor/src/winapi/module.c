@@ -75,7 +75,7 @@ __winfnc HANDLE LoadLibraryExW(const char16_t *name, HANDLE file, DWORD flags) {
     if(!module) { winerr_set_errno(); return NULL; }
     *module = (struct winmodule) {0};
     module->name = winstr_to_str(name);
-    log_debug("DIAG: LoadLibraryExW('%s') -> dummy module (no real content loaded)", module->name);
+    log_verbose("LoadLibraryExW('%s') -> dummy module (no real content loaded)", module->name);
     winmodule_register(module);
     return module->handle;
 }
@@ -89,7 +89,7 @@ __winfnc HANDLE LoadLibraryA(const char *name) {
     if(!module) { winerr_set_errno(); return NULL; }
     *module = (struct winmodule) {0};
     module->name = strdup(name);
-    log_debug("DIAG: LoadLibraryA('%s') -> dummy module (no real content loaded)", module->name);
+    log_verbose("LoadLibraryA('%s') -> dummy module (no real content loaded)", module->name);
     winmodule_register(module);
     return module->handle;
 }
@@ -244,7 +244,7 @@ __winfnc void *GetProcAddress(HANDLE handle, const char *name) {
 
     //Try to resolve the Windows API function
     void *resolv = resolve_windows_api(name);
-    log_debug("DIAG: GetProcAddress('%s') from module '%s' -> %p", name, module->name, resolv);
+    log_verbose("GetProcAddress('%s') from module '%s' -> %p", name, module->name, resolv);
     if(!resolv) winerr_set();
     return resolv;
 }

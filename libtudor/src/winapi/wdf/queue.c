@@ -98,7 +98,7 @@ __winfnc NTSTATUS WdfIoQueueCreate(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device
     wdf_add_device_queue(queue->device, queue);
 
     if(out) *out = &queue->object;
-    log_debug("DIAG: WdfIoQueueCreate queue=%p DispatchType=%u EvtIoDeviceControl=%p", queue, config->DispatchType, (void*) config->EvtIoDeviceControl);
+    log_verbose("WdfIoQueueCreate queue=%p DispatchType=%u EvtIoDeviceControl=%p", queue, config->DispatchType, (void*) config->EvtIoDeviceControl);
     return STATUS_SUCCESS;
 }
 WDFFUNC(WdfIoQueueCreate, 85)
@@ -117,7 +117,7 @@ WDFFUNC(WdfIoQueueCreate, 85)
 //the driver's own (real, unmodified) code handle "nothing to do yet" instead of dereferencing our
 //stub's return value as if it were a request.
 __winfnc NTSTATUS WdfIoQueueRetrieveNextRequest(WDF_DRIVER_GLOBALS *globals, WDFOBJECT queue_obj, WDFOBJECT *out_request) {
-    log_debug("DIAG: WdfIoQueueRetrieveNextRequest queue=%p", queue_obj);
+    log_verbose("WdfIoQueueRetrieveNextRequest queue=%p", queue_obj);
     if(out_request) *out_request = NULL;
     return 0x8000001A; /* STATUS_NO_MORE_ITEMS */
 }
