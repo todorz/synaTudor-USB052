@@ -1,7 +1,6 @@
 #include <asm/prctl.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
-#include <sys/random.h>
 #include <unistd.h>
 #include <pthread.h>
 #include "internal.h"
@@ -292,70 +291,6 @@ __winfnc BOOL IsProcessorFeaturePresent(DWORD feature) {
 }
 WINAPI(IsProcessorFeaturePresent)
 
-#define ARM64_MAX_BREAKPOINTS 8
-#define ARM64_MAX_WATCHPOINTS 2
-
-typedef union {
-    struct {
-        ULONGLONG Low;
-        LONGLONG High;
-    } DUMMYSTRUCTNAME;
-    double D[2];
-    float S[4];
-    WORD H[8];
-    BYTE B[16];
-} ARM64_NT_NEON128;
-
-typedef struct {
-    DWORD ContextFlags;
-    DWORD Cpsr;
-    union {
-        struct {
-            DWORD64 X0;
-            DWORD64 X1;
-            DWORD64 X2;
-            DWORD64 X3;
-            DWORD64 X4;
-            DWORD64 X5;
-            DWORD64 X6;
-            DWORD64 X7;
-            DWORD64 X8;
-            DWORD64 X9;
-            DWORD64 X10;
-            DWORD64 X11;
-            DWORD64 X12;
-            DWORD64 X13;
-            DWORD64 X14;
-            DWORD64 X15;
-            DWORD64 X16;
-            DWORD64 X17;
-            DWORD64 X18;
-            DWORD64 X19;
-            DWORD64 X20;
-            DWORD64 X21;
-            DWORD64 X22;
-            DWORD64 X23;
-            DWORD64 X24;
-            DWORD64 X25;
-            DWORD64 X26;
-            DWORD64 X27;
-            DWORD64 X28;
-            DWORD64 Fp;
-            DWORD64 Lr;
-        } DUMMYSTRUCTNAME;
-        DWORD64 X[31];
-    } DUMMYUNIONNAME;
-    DWORD64 Sp;
-    DWORD64 Pc;
-    ARM64_NT_NEON128 V[32];
-    DWORD Fpcr;
-    DWORD Fpsr;
-    DWORD Bcr[ARM64_MAX_BREAKPOINTS];
-    DWORD64 Bvr[ARM64_MAX_BREAKPOINTS];
-    DWORD Wcr[ARM64_MAX_WATCHPOINTS];
-    DWORD64 Wvr[ARM64_MAX_WATCHPOINTS];
-} ARM64_NT_CONTEXT;
-
 //Prefix of the real AMD64 CONTEXT struct layout (winnt.h), up through the general-purpose
 //registers. The caller always allocates a full-size real CONTEXT (its compiler knows the true,
 //much larger size including FP/vector state), so writing only this prefix and leaving the rest
@@ -372,39 +307,19 @@ typedef struct {
     DWORD64 Rip;
 } AMD64_CONTEXT_PREFIX;
 
+//The driver's CRT only calls this from its stack-buffer-overrun reporting path (__report_gsfailure:
+//RtlCaptureContext -> RtlLookupFunctionEntry -> RtlVirtualUnwind, right before fast-failing), i.e.
+//after a stack cookie check has already failed. Its security cookie setup doesn't use it. So no real
+//register capture is needed - just a well-formed x86-64 context: zeroed, with the fixed user-mode
+//segment/flag values and the caller's real stack and instruction pointers.
 __winfnc void RtlCaptureContext(AMD64_CONTEXT_PREFIX *context) {
-    //This is used by the CRT (e.g. __security_init_cookie) as one of several entropy sources.
-    //A previous version of this stub zeroed an ARM64 CONTEXT here instead of an x86-64 one,
-    //which fed the CRT's security-cookie derivation entirely degenerate/zero entropy; that in
-    //turn made the derived cookie match the compiled-in default, which the CRT deliberately
-    //fast-fails on (STATUS_STACK_BUFFER_OVERRUN) as an anti-tampering measure. Real, non-zero
-    //register values (not necessarily an exact caller-context capture) are what's needed here.
-    DWORD64 regs[16];
-    if(getrandom(regs, sizeof(regs), 0) != sizeof(regs)) {
-        for(int i = 0; i < 16; i++) regs[i] = (DWORD64) (uintptr_t) &regs[i];
-    }
-
+    log_warn("RtlCaptureContext called - the driver is likely reporting a stack buffer overrun!");
     *context = (AMD64_CONTEXT_PREFIX) {0};
     context->MxCsr = 0x1f80;
     context->SegCs = 0x33;
     context->SegSs = 0x2b;
     context->EFlags = 0x202;
-    context->Rax = regs[0];
-    context->Rcx = regs[1];
-    context->Rdx = regs[2];
-    context->Rbx = regs[3];
     context->Rsp = (DWORD64) (uintptr_t) __builtin_frame_address(0);
-    context->Rbp = regs[5];
-    context->Rsi = regs[6];
-    context->Rdi = regs[7];
-    context->R8 = regs[8];
-    context->R9 = regs[9];
-    context->R10 = regs[10];
-    context->R11 = regs[11];
-    context->R12 = regs[12];
-    context->R13 = regs[13];
-    context->R14 = regs[14];
-    context->R15 = regs[15];
     context->Rip = (DWORD64) (uintptr_t) __builtin_return_address(0);
 }
 WINAPI(RtlCaptureContext)
