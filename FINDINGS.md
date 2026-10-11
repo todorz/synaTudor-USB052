@@ -3231,3 +3231,18 @@ event and stopped, with the capture worker at **100% CPU**. Fixed:
    `sec*10^4 + usec`; it's now real FILETIME (100ns ticks since 1601).
 
 Verified: plain open/close and identify -> Ctrl+C -> close both exit normally.
+
+### libfprint / fprintd path works
+
+After installing the current build, `sudo fprintd-enroll` completed and
+`fprintd-verify` returned `verify-match`, so the full fprintd → libfprint-tod
+→ tudor-host-launcher → sandboxed tudor_host path works with the new shim (the
+seccomp allowlist already covered everything the new code needs). The TOD
+module hard-coded 8 enroll stages and reported every extra "more samples"
+response as `enroll-retry-scan`. This driver's progress steps by 1/12, so
+`TUDOR_NUM_ENROLL_STAGES` is now 12.
+
+Notes: enrolling needs polkit authorization (`net.reactivated.fprint.device.enroll`),
+so without a polkit agent (e.g. bare Hyprland) use `sudo fprintd-enroll -f
+<finger> <user>`. Running `sudo ninja install` leaves root-owned files in
+`build/`; `chown` it back afterwards.
