@@ -192,10 +192,15 @@ int main() {
     }
     log_info("Opened tudor device");
 
-    //Check that we have determined the sensor name
+    //Check that we have determined the sensor name. Experimentally, this driver doesn't always
+    //query pairing data (which is what establishes the name, via get_pdata_cb below) during device
+    //open - it may only do so later, from within an actual enroll/verify capture. Treat a still-
+    //unknown name here as non-fatal rather than aborting startup entirely: the IPC_MSG_PROBE
+    //handler (handler.c) sends probe_sensor_name as-is regardless, and an empty/placeholder name at
+    //probe time (before any real device-facing operation has happened) shouldn't matter for a value
+    //that's used as a display name, not a pairing-data storage key.
     if(!has_sensor_name) {
-        log_error("Failed to acquire sensor name!");
-        return EXIT_FAILURE;
+        log_warn("Sensor name not yet determined at open time - continuing anyway.");
     }
 
     //Send ready message

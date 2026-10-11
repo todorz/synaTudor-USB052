@@ -1,5 +1,8 @@
 #include "internal.h"
 
+//Real WDF USB target implementation (libusb-backed) - the standard mechanism WBDI drivers use for
+//USB I/O. Confirmed dead code for this driver (never called) - see FINDINGS.md.
+
 typedef struct {
     ULONG USBDI_Version;
     ULONG Supported_USB_Version;
@@ -41,23 +44,9 @@ typedef struct {
     ULONG Traits;
 } WDF_USB_DEVICE_INFORMATION;
 
-typedef enum {
-    WdfUsbPipeTypeInvalid,
-    WdfUsbPipeTypeControl,
-    WdfUsbPipeTypeIsochronous,
-    WdfUsbPipeTypeBulk,
-    WdfUsbPipeTypeInterrupt
-} WDF_USB_PIPE_TYPE;
-
-typedef struct {
-    ULONG Size;
-    ULONG MaximumPacketSize;
-    UCHAR EndpointAddress;
-    UCHAR Interval;
-    UCHAR SettingIndex;
-    WDF_USB_PIPE_TYPE PipeType;
-    ULONG MaximumTransferSize;
-} WDF_USB_PIPE_INFORMATION;
+//WDF_USB_PIPE_TYPE/WDF_USB_PIPE_INFORMATION moved to winapi/wdf/wdf.h - shared with
+//tudor/com_activate.c's IWDFUsbTargetPipe bridge, which needs WdfUsbInterfaceGetConfiguredPipe's
+//real out-param type to cache pipe info at facade-creation time.
 
 typedef struct {
     ULONG Size;
@@ -146,6 +135,7 @@ static void usb_if_destr(struct wdf_usb_interface *usb_if) {
 }
 
 __winfnc NTSTATUS WdfUsbTargetDeviceCreate(WDF_DRIVER_GLOBALS *globals, WDFOBJECT dev_obj, WDF_OBJECT_ATTRIBUTES *obj_attrs, WDFOBJECT *out) {
+    log_debug("DIAG: WdfUsbTargetDeviceCreate called! [dev_obj=%p]", dev_obj);
     struct winwdf_device *dev = (struct winwdf_device*) dev_obj;
     if(!wdf_get_libusb_device(dev)) {
         log_warn("Attempted to create WDF USB device for non-USB device!");
@@ -236,6 +226,7 @@ __winfnc NTSTATUS WdfUsbTargetDeviceResetPortSynchronously(WDF_DRIVER_GLOBALS *g
 WDFFUNC(WdfUsbTargetDeviceResetPortSynchronously, 214)
 
 __winfnc WDFOBJECT WdfUsbTargetDeviceGetInterface(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_dev_obj, UCHAR interface_idx) {
+    log_debug("DIAG: WdfUsbTargetDeviceGetInterface called! [interface_idx=%d]", (int) interface_idx);
     struct wdf_usb_device *usb_dev = (struct wdf_usb_device*) usb_dev_obj;
     if(interface_idx >= usb_dev->cfg_descr->bNumInterfaces) return NULL;
 
@@ -357,9 +348,14 @@ __winfnc NTSTATUS WdfUsbTargetPipeResetSynchronously(WDF_DRIVER_GLOBALS *globals
 }
 WDFFUNC(WdfUsbTargetPipeResetSynchronously, 228)
 
+//buf/buf_len carry the actual transfer target; mem_obj_ref is ONLY used to populate
+//WDF_USB_REQUEST_COMPLETION_PARAMS' informational Buffer field for flat-table callers (a real
+//WDFOBJECT wrapping a struct wdf_memory) - COM-originated requests (see com_activate.c's USB
+//target facades) have no such object and pass buf/buf_len directly instead, leaving this NULL.
 struct transfer_req_ctx {
-    struct wdf_memory *mem;
-    WDFMEMORY_OFFSET mem_off;
+    void *buf;
+    size_t buf_len;
+    WDFOBJECT mem_obj_ref;
     struct winwdf_request *request;
     void *ctrl_buf;
 
@@ -377,6 +373,7 @@ struct transfer_req_ctx {
 
 static void pipe_transfer_callback(struct libusb_transfer *transfer) {
     struct transfer_req_ctx *ctx = (struct transfer_req_ctx*) transfer->user_data;
+    log_debug("DIAG: pipe_transfer_callback called! [ep=0x%02x status=%d actual_len=%d]", transfer->endpoint, transfer->status, transfer->actual_length);
 
     //Handle status
     if(transfer->status == LIBUSB_TRANSFER_CANCELLED) {
@@ -405,14 +402,14 @@ static void pipe_transfer_callback(struct libusb_transfer *transfer) {
 
     if(((transfer->endpoint & 0b10000000) == LIBUSB_ENDPOINT_IN)) {
         usb_params.Type = WdfUsbRequestTypePipeRead;
-        usb_params.Parameters.PipeRead.Buffer = &ctx->mem->object;
+        usb_params.Parameters.PipeRead.Buffer = ctx->mem_obj_ref;
         usb_params.Parameters.PipeRead.Length = transfer->actual_length;
-        usb_params.Parameters.PipeRead.Offset = ctx->mem_off.BufferOffset;
+        usb_params.Parameters.PipeRead.Offset = 0;
     } else {
         usb_params.Type = WdfUsbRequestTypePipeWrite;
-        usb_params.Parameters.PipeWrite.Buffer = &ctx->mem->object;
+        usb_params.Parameters.PipeWrite.Buffer = ctx->mem_obj_ref;
         usb_params.Parameters.PipeWrite.Length = transfer->actual_length;
-        usb_params.Parameters.PipeWrite.Offset = ctx->mem_off.BufferOffset;
+        usb_params.Parameters.PipeWrite.Offset = 0;
     }
 
     WDF_REQUEST_COMPLETION_PARAMS params;
@@ -423,13 +420,14 @@ static void pipe_transfer_callback(struct libusb_transfer *transfer) {
     params.Parameters.Usb.Completion = &usb_params;
 
     if(ctx->ctrl_buf) {
-        memcpy(ctx->mem->data + ctx->mem_off.BufferOffset, (BYTE*) ctx->ctrl_buf + sizeof(struct libusb_control_setup), ctx->mem_off.BufferLength);
+        memcpy(ctx->buf, (BYTE*) ctx->ctrl_buf + sizeof(struct libusb_control_setup), ctx->buf_len);
     }
 
     wdf_complete_request(ctx->request, status, &params);
 }
 
 static NTSTATUS usb_transfer_start(struct winwdf_request *req, struct transfer_req_ctx *ctx, WDFOBJECT target, int timeout, void **data) {
+    log_debug("DIAG: usb_transfer_start called! [ep=0x%02x len=%d timeout=%d]", ctx->transfer ? ctx->transfer->endpoint : 0, (int) ctx->buf_len, timeout);
     *data = NULL;
 
     //Initialize remaining transfer fields
@@ -437,11 +435,11 @@ static NTSTATUS usb_transfer_start(struct winwdf_request *req, struct transfer_r
     ctx->transfer->callback = (libusb_transfer_cb_fn) pipe_transfer_callback;
     ctx->transfer->user_data = ctx;
 
-    ctx->transfer->buffer = ctx->ctrl_buf ? ctx->ctrl_buf : (ctx->mem->data + ctx->mem_off.BufferOffset);
-    ctx->transfer->length = (ctx->ctrl_buf ? sizeof(struct libusb_control_setup) : 0) + (int) ctx->mem_off.BufferLength;
+    ctx->transfer->buffer = ctx->ctrl_buf ? ctx->ctrl_buf : ctx->buf;
+    ctx->transfer->length = (ctx->ctrl_buf ? sizeof(struct libusb_control_setup) : 0) + (int) ctx->buf_len;
 
     if(ctx->ctrl_buf) {
-        memcpy((BYTE*) ctx->ctrl_buf + sizeof(struct libusb_control_setup), ctx->mem->data + ctx->mem_off.BufferOffset, ctx->mem_off.BufferLength);
+        memcpy((BYTE*) ctx->ctrl_buf + sizeof(struct libusb_control_setup), ctx->buf, ctx->buf_len);
     }
 
     //Submit the transfer
@@ -471,6 +469,7 @@ static void usb_transfer_cleanup(struct winwdf_request *req, struct transfer_req
 }
 
 __winfnc NTSTATUS WdfUsbTargetDeviceFormatRequestForControlTransfer(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_dev_obj, WDFOBJECT req_obj, WDF_USB_CONTROL_SETUP_PACKET *packet, WDFOBJECT mem_obj, WDFMEMORY_OFFSET *mem_off) {
+    log_debug("DIAG: WdfUsbTargetDeviceFormatRequestForControlTransfer called!");
     struct wdf_usb_device *usb_dev = (struct wdf_usb_device*) usb_dev_obj;
     struct wdf_memory *mem = (struct wdf_memory*) mem_obj;
     struct winwdf_request *req = (struct winwdf_request*) req_obj;
@@ -479,14 +478,16 @@ __winfnc NTSTATUS WdfUsbTargetDeviceFormatRequestForControlTransfer(WDF_DRIVER_G
     struct transfer_req_ctx *ctx = (struct transfer_req_ctx*) malloc(sizeof(struct transfer_req_ctx));
     if(!ctx) return winerr_from_errno();
 
-    ctx->mem = mem;
-    ctx->mem_off = mem_off ? *mem_off : ((WDFMEMORY_OFFSET) { .BufferOffset = 0, .BufferLength = mem->data_size });
+    WDFMEMORY_OFFSET off = mem_off ? *mem_off : ((WDFMEMORY_OFFSET) { .BufferOffset = 0, .BufferLength = mem->data_size });
+    ctx->buf = (uint8_t*) mem->data + off.BufferOffset;
+    ctx->buf_len = off.BufferLength;
+    ctx->mem_obj_ref = mem_obj;
     ctx->request = req;
 
-    ctx->ctrl_buf = malloc(sizeof(struct libusb_control_setup) + ctx->mem_off.BufferLength);
+    ctx->ctrl_buf = malloc(sizeof(struct libusb_control_setup) + ctx->buf_len);
     if(!ctx->ctrl_buf) { free(ctx); return winerr_from_errno(); }
     memcpy(ctx->ctrl_buf, packet, sizeof(struct libusb_control_setup));
-    ((struct libusb_control_setup*) ctx->ctrl_buf)->wLength = (uint16_t) ctx->mem_off.BufferLength;
+    ((struct libusb_control_setup*) ctx->ctrl_buf)->wLength = (uint16_t) ctx->buf_len;
     
     ctx->transfer = libusb_alloc_transfer(0);
     if(!ctx->transfer) { return winerr_from_errno(); }
@@ -502,10 +503,11 @@ __winfnc NTSTATUS WdfUsbTargetDeviceFormatRequestForControlTransfer(WDF_DRIVER_G
 }
 WDFFUNC(WdfUsbTargetDeviceFormatRequestForControlTransfer, 213)
 
-__winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForRead(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_pipe_obj, WDFOBJECT req_obj, WDFOBJECT mem_obj, WDFMEMORY_OFFSET *mem_off) {
-    struct wdf_usb_pipe *usb_pipe = (struct wdf_usb_pipe*) usb_pipe_obj;
-    struct wdf_memory *mem = (struct wdf_memory*) mem_obj;
-    struct winwdf_request *req = (struct winwdf_request*) req_obj;
+//Shared core for both the flat wdf_memory-based entry points below and the raw-buffer variants
+//(wdf_usb_pipe_format_request_for_{read,write}_raw) used by com_activate.c's COM USB target
+//facades, whose IWDFMemory objects aren't struct wdf_memory (see transfer_req_ctx's own comment).
+static NTSTATUS usb_pipe_format_request_for_read_core(struct wdf_usb_pipe *usb_pipe, struct winwdf_request *req, void *buf, size_t buf_len, WDFOBJECT mem_obj_ref) {
+    log_debug("DIAG: usb_pipe_format_request_for_read_core called! [ep=0x%02x len=%zu]", usb_pipe->libusb_ep->bEndpointAddress, buf_len);
 
     //Check the endpoint direction
     if((usb_pipe->libusb_ep->bEndpointAddress & 0b10000000) != LIBUSB_ENDPOINT_IN) {
@@ -528,13 +530,14 @@ __winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForRead(WDF_DRIVER_GLOBALS *globa
     struct transfer_req_ctx *ctx = (struct transfer_req_ctx*) malloc(sizeof(struct transfer_req_ctx));
     if(!ctx) return winerr_from_errno();
 
-    ctx->mem = mem;
-    ctx->mem_off = mem_off ? *mem_off : ((WDFMEMORY_OFFSET) { .BufferOffset = 0, .BufferLength = mem->data_size });
+    ctx->buf = buf;
+    ctx->buf_len = buf_len;
+    ctx->mem_obj_ref = mem_obj_ref;
     ctx->request = req;
     ctx->ctrl_buf = NULL;
-    
+
     ctx->transfer = libusb_alloc_transfer(0);
-    if(!ctx->transfer) { return winerr_from_errno(); }
+    if(!ctx->transfer) { free(ctx); return winerr_from_errno(); }
 
     ctx->transfer->dev_handle = usb_pipe->usb_if->usb_device->libusb_dev;
     ctx->transfer->endpoint = usb_pipe->libusb_ep->bEndpointAddress;
@@ -546,12 +549,9 @@ __winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForRead(WDF_DRIVER_GLOBALS *globa
 
     return STATUS_SUCCESS;
 }
-WDFFUNC(WdfUsbTargetPipeFormatRequestForRead, 224)
 
-__winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForWrite(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_pipe_obj, WDFOBJECT req_obj, WDFOBJECT mem_obj, WDFMEMORY_OFFSET *mem_off) {
-    struct wdf_usb_pipe *usb_pipe = (struct wdf_usb_pipe*) usb_pipe_obj;
-    struct wdf_memory *mem = (struct wdf_memory*) mem_obj;
-    struct winwdf_request *req = (struct winwdf_request*) req_obj;
+static NTSTATUS usb_pipe_format_request_for_write_core(struct wdf_usb_pipe *usb_pipe, struct winwdf_request *req, void *buf, size_t buf_len, WDFOBJECT mem_obj_ref) {
+    log_debug("DIAG: usb_pipe_format_request_for_write_core called! [ep=0x%02x len=%zu]", usb_pipe->libusb_ep->bEndpointAddress, buf_len);
 
     //Check the endpoint direction
     if((usb_pipe->libusb_ep->bEndpointAddress & 0b10000000) != LIBUSB_ENDPOINT_OUT) {
@@ -574,13 +574,14 @@ __winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForWrite(WDF_DRIVER_GLOBALS *glob
     struct transfer_req_ctx *ctx = (struct transfer_req_ctx*) malloc(sizeof(struct transfer_req_ctx));
     if(!ctx) return winerr_from_errno();
 
-    ctx->mem = mem;
-    ctx->mem_off = mem_off ? *mem_off : ((WDFMEMORY_OFFSET) { .BufferOffset = 0, .BufferLength = mem->data_size });
+    ctx->buf = buf;
+    ctx->buf_len = buf_len;
+    ctx->mem_obj_ref = mem_obj_ref;
     ctx->request = req;
     ctx->ctrl_buf = NULL;
-    
+
     ctx->transfer = libusb_alloc_transfer(0);
-    if(!ctx->transfer) { return winerr_from_errno(); }
+    if(!ctx->transfer) { free(ctx); return winerr_from_errno(); }
 
     ctx->transfer->dev_handle = usb_pipe->usb_if->usb_device->libusb_dev;
     ctx->transfer->endpoint = usb_pipe->libusb_ep->bEndpointAddress;
@@ -592,4 +593,36 @@ __winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForWrite(WDF_DRIVER_GLOBALS *glob
 
     return STATUS_SUCCESS;
 }
+
+__winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForRead(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_pipe_obj, WDFOBJECT req_obj, WDFOBJECT mem_obj, WDFMEMORY_OFFSET *mem_off) {
+    struct wdf_usb_pipe *usb_pipe = (struct wdf_usb_pipe*) usb_pipe_obj;
+    struct wdf_memory *mem = (struct wdf_memory*) mem_obj;
+    struct winwdf_request *req = (struct winwdf_request*) req_obj;
+    WDFMEMORY_OFFSET off = mem_off ? *mem_off : ((WDFMEMORY_OFFSET) { .BufferOffset = 0, .BufferLength = mem->data_size });
+    return usb_pipe_format_request_for_read_core(usb_pipe, req, (uint8_t*) mem->data + off.BufferOffset, off.BufferLength, mem_obj);
+}
+WDFFUNC(WdfUsbTargetPipeFormatRequestForRead, 224)
+
+__winfnc NTSTATUS WdfUsbTargetPipeFormatRequestForWrite(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_pipe_obj, WDFOBJECT req_obj, WDFOBJECT mem_obj, WDFMEMORY_OFFSET *mem_off) {
+    struct wdf_usb_pipe *usb_pipe = (struct wdf_usb_pipe*) usb_pipe_obj;
+    struct wdf_memory *mem = (struct wdf_memory*) mem_obj;
+    struct winwdf_request *req = (struct winwdf_request*) req_obj;
+    WDFMEMORY_OFFSET off = mem_off ? *mem_off : ((WDFMEMORY_OFFSET) { .BufferOffset = 0, .BufferLength = mem->data_size });
+    return usb_pipe_format_request_for_write_core(usb_pipe, req, (uint8_t*) mem->data + off.BufferOffset, off.BufferLength, mem_obj);
+}
 WDFFUNC(WdfUsbTargetPipeFormatRequestForWrite, 222)
+
+//Raw-buffer entry points for com_activate.c's COM USB target facades - see transfer_req_ctx and
+//usb_pipe_format_request_for_{read,write}_core's own comments for why these exist alongside the
+//wdf_memory-based flat entry points above.
+NTSTATUS wdf_usb_pipe_format_request_for_read_raw(struct wdf_usb_pipe *usb_pipe, struct winwdf_request *req, void *buf, size_t buf_len) {
+    return usb_pipe_format_request_for_read_core(usb_pipe, req, buf, buf_len, NULL);
+}
+
+NTSTATUS wdf_usb_pipe_format_request_for_write_raw(struct wdf_usb_pipe *usb_pipe, struct winwdf_request *req, void *buf, size_t buf_len) {
+    return usb_pipe_format_request_for_write_core(usb_pipe, req, buf, buf_len, NULL);
+}
+
+int wdf_usb_device_get_num_interfaces(struct wdf_usb_device *usb_dev) {
+    return usb_dev->cfg_descr->bNumInterfaces;
+}

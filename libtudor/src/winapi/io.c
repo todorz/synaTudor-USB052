@@ -57,6 +57,9 @@ struct ovlp_cb {
 };
 
 static void *ovlp_cb_thread_func(struct ovlp_cb *cb) {
+    //The callback runs driver code, which needs this thread's own TIB - a new pthread otherwise
+    //inherits its creator's GS base, so e.g. __chkstk would probe against the creator's stack limit.
+    win_init_tib();
     cb->cb(cb->ovlp, cb->status, cb->ctx);
     free(cb);
     return NULL;
@@ -175,6 +178,13 @@ __winfnc BOOL CancelIoEx(HANDLE file, OVERLAPPED *ovlp) {
 }
 WINAPI(CancelIoEx)
 
+__winfnc BOOL CancelIo(HANDLE file) {
+    //Only cancellation of a specific OVERLAPPED is tracked here (CancelIoEx)
+    log_warn("CancelIo(%p) called - not supported", (void*) file);
+    return TRUE;
+}
+WINAPI(CancelIo)
+
 __winfnc BOOL GetOverlappedResult(HANDLE file, OVERLAPPED *ovlp, DWORD *num_transfered, BOOL wait) {
     if(ovlp->Internal == STATUS_PENDING && !wait) return FALSE;
 
@@ -191,6 +201,7 @@ __winfnc BOOL GetOverlappedResult(HANDLE file, OVERLAPPED *ovlp, DWORD *num_tran
 WINAPI(GetOverlappedResult)
 
 __winfnc BOOL ReadFile(HANDLE handle, void *buf, DWORD buf_size, DWORD *num_read, OVERLAPPED *ovlp) {
+    log_debug("DIAG: ReadFile called! [handle=%p buf_size=%u]", (void*) handle, (unsigned) buf_size);
     struct winfile *file = (struct winfile*) handle->data;
     if(!file->read_fnc) { winerr_set(); return FALSE; }
 
@@ -219,6 +230,7 @@ __winfnc BOOL ReadFile(HANDLE handle, void *buf, DWORD buf_size, DWORD *num_read
 WINAPI(ReadFile)
 
 __winfnc BOOL WriteFile(HANDLE handle, const void *buf, DWORD buf_size, DWORD *num_written, OVERLAPPED *ovlp) {
+    log_debug("DIAG: WriteFile called! [handle=%p buf_size=%u]", (void*) handle, (unsigned) buf_size);
     struct winfile *file = (struct winfile*) handle->data;
     if(!file->write_fnc) { winerr_set(); return FALSE; }
 
@@ -247,6 +259,7 @@ __winfnc BOOL WriteFile(HANDLE handle, const void *buf, DWORD buf_size, DWORD *n
 WINAPI(WriteFile)
 
 __winfnc BOOL DeviceIoControl(HANDLE handle, DWORD code, const void *in_buf, DWORD in_size, void *out_buf, DWORD out_size, DWORD *out_ret, OVERLAPPED *ovlp) {
+    log_debug("DIAG: DeviceIoControl called! [handle=%p code=0x%x in_size=%u out_size=%u]", (void*) handle, (unsigned) code, (unsigned) in_size, (unsigned) out_size);
     struct winfile *file = (struct winfile*) handle->data;
     if(!file->devctrl_fnc) { winerr_set(); return FALSE; }
 

@@ -75,10 +75,25 @@ __winfnc HANDLE LoadLibraryExW(const char16_t *name, HANDLE file, DWORD flags) {
     if(!module) { winerr_set_errno(); return NULL; }
     *module = (struct winmodule) {0};
     module->name = winstr_to_str(name);
+    log_debug("DIAG: LoadLibraryExW('%s') -> dummy module (no real content loaded)", module->name);
     winmodule_register(module);
     return module->handle;
 }
 WINAPI(LoadLibraryExW)
+
+//Same "dummy module" approach as LoadLibraryExW above - we don't support loading real library
+//content dynamically, but some callers just need a handle back for a name they'll pass to
+//GetProcAddress or check for null-ness, not actually execute code from.
+__winfnc HANDLE LoadLibraryA(const char *name) {
+    struct winmodule *module = (struct winmodule*) malloc(sizeof(struct winmodule));
+    if(!module) { winerr_set_errno(); return NULL; }
+    *module = (struct winmodule) {0};
+    module->name = strdup(name);
+    log_debug("DIAG: LoadLibraryA('%s') -> dummy module (no real content loaded)", module->name);
+    winmodule_register(module);
+    return module->handle;
+}
+WINAPI(LoadLibraryA)
 
 __winfnc BOOL FreeLibrary(HANDLE handle) {
     winhandle_destroy(handle);
@@ -87,14 +102,28 @@ __winfnc BOOL FreeLibrary(HANDLE handle) {
 WINAPI(FreeLibrary)
 
 __winfnc HANDLE GetModuleHandleA(const char *name) {
+    //A NULL name is a legitimate, common request for "the currently executing module's own
+    //handle" (real Win32 GetModuleHandle semantics), not an error.
+    if(!name) {
+        struct winmodule *cur = winmodule_get_cur();
+        return cur ? cur->handle : NULL;
+    }
+
     struct winmodule *module = (struct winmodule*) winmodule_find(name);
+    if(!module) log_warn("GetModuleHandleA: Module '%s' not found!", name);
     return module ? module->handle : NULL;
 }
 WINAPI(GetModuleHandleA)
 
 __winfnc HANDLE GetModuleHandleW(const char16_t *name) {
+    if(!name) {
+        struct winmodule *cur = winmodule_get_cur();
+        return cur ? cur->handle : NULL;
+    }
+
     char *cname = winstr_to_str(name);
     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
+    if(!module) log_warn("GetModuleHandleW: Module '%s' not found!", cname);
     free(cname);
     return module ? module->handle : NULL;
 }
@@ -107,6 +136,13 @@ __winfnc BOOL GetModuleHandleExW(DWORD flags, const char16_t *name, HANDLE *out)
         return FALSE;
     }
 
+    if(!name) {
+        struct winmodule *cur = winmodule_get_cur();
+        if(!cur) return FALSE;
+        *out = cur->handle;
+        return TRUE;
+    }
+
     char *cname = winstr_to_str(name);
     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
     free(cname);
@@ -116,22 +152,42 @@ __winfnc BOOL GetModuleHandleExW(DWORD flags, const char16_t *name, HANDLE *out)
 }
 WINAPI(GetModuleHandleExW)
 
+//Real GetModuleFileName always returns a full, absolute path - callers routinely strip the
+//filename back off to get at the containing directory (e.g. to look for a companion config file
+//alongside the module). module->name here is just the bare DLL name ("synaBscAdapter52.dll", no
+//path), which made any such strip-to-directory operation legitimately return an empty string -
+//confirmed live as the reason synaBscAdapter52.dll's own StartCapture path treats its engine
+//context as never-initialized (a length-0 check on the stripped directory gates a flag the driver
+//needs set to complete a real capture). Synthesizing a plausible absolute path here (only when
+//the name doesn't already look like one) fixes that class of caller without touching module->name
+//itself, which winmodule_find and friends still match against by the bare name.
+static char *module_fake_full_path(const char *name) {
+    char *path;
+    if(strchr(name, '\\') || strchr(name, '/')) path = strdup(name);
+    else cant_fail(asprintf(&path, "C:\\Windows\\System32\\drivers\\UMDF\\%s", name));
+    return path;
+}
+
 __winfnc DWORD GetModuleFileNameA(HANDLE handle, char *name, DWORD size) {
     struct winmodule *module = handle ? (struct winmodule*) handle->data : cur_module;
- 
-    int name_len = strlen(module->name);
+
+    char *full_path = module_fake_full_path(module->name);
+    int name_len = strlen(full_path);
 
     if(size == 0) {
+        free(full_path);
         winerr_set_code(ERROR_INSUFFICIENT_BUFFER);
         return 0;
     } else if(name_len+1 <= size) {
-        memcpy(name, module->name, name_len+1);
+        memcpy(name, full_path, name_len+1);
         winerr_clear();
+        free(full_path);
         return name_len;
     } else {
         name_len = size - 1;
-        memcpy(name, module->name, name_len+1);
+        memcpy(name, full_path, name_len+1);
         winerr_set_code(ERROR_INSUFFICIENT_BUFFER);
+        free(full_path);
         return name_len;
     }
 }
@@ -139,8 +195,10 @@ WINAPI(GetModuleFileNameA)
 
 __winfnc DWORD GetModuleFileNameW(HANDLE handle, char16_t *name, DWORD size) {
     struct winmodule *module = handle ? (struct winmodule*) handle->data : cur_module;
- 
-    char16_t *wname = winstr_from_str(module->name);
+
+    char *full_path = module_fake_full_path(module->name);
+    char16_t *wname = winstr_from_str(full_path);
+    free(full_path);
     int wname_len = winstr_len(wname);
 
     if(size == 0) {
@@ -168,6 +226,12 @@ __winfnc BOOL DisableThreadLibraryCalls(HANDLE handle) {
 WINAPI(DisableThreadLibraryCalls)
 
 __winfnc void *GetProcAddress(HANDLE handle, const char *name) {
+    if(!handle) {
+        log_warn("GetProcAddress: Called with NULL module handle! [name '%s']", name);
+        winerr_set_code(ERROR_MOD_NOT_FOUND);
+        return NULL;
+    }
+
     struct winmodule *module = (struct winmodule*) handle->data;
 
     //Check if it's an ordinal import
@@ -180,6 +244,7 @@ __winfnc void *GetProcAddress(HANDLE handle, const char *name) {
 
     //Try to resolve the Windows API function
     void *resolv = resolve_windows_api(name);
+    log_debug("DIAG: GetProcAddress('%s') from module '%s' -> %p", name, module->name, resolv);
     if(!resolv) winerr_set();
     return resolv;
 }

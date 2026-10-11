@@ -87,6 +87,9 @@ struct pe_file {
     //Relocations
     int num_relocs;
     struct pe_reloc *relocations;
+
+    //Load config (only security_cookie_rva is currently parsed; 0 if not present)
+    uint32_t security_cookie_rva;
 };
 
 bool pe_parse(struct pe_file *pe, uint8_t *data, int size);

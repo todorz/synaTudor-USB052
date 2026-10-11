@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <time.h>
 #include "internal.h"
 
 static void req_cb(struct winwdf_request *req, NTSTATUS status, OVERLAPPED *ovlp) {
@@ -25,6 +26,72 @@ static void req_cb(struct winwdf_request *req, NTSTATUS status, OVERLAPPED *ovlp
     winio_complete_overlapped(ovlp, status, num_transfered);
 }
 
+//Force-completes a devctrl request with a timeout if the driver never completes it on its own
+//(StartCapture's completion machinery isn't fully replicated here - see FINDINGS.md). Uses a
+//cancellable timed wait rather than a blind sleep+complete, since the latter caused a real
+//use-after-free (watchdog firing after the request was already completed and freed) - see
+//FINDINGS.md.
+//
+//A prior version of this (per-context lock/cond, unlinking from the list before firing) still had
+//a genuine TOCTOU race: devctrl_watchdog_cancel could search the list, find nothing (because the
+//watchdog had just unlinked itself), and return, while that same watchdog thread was still
+//between unlinking and actually calling WdfRequestComplete - letting tudor_cleanup destroy the
+//request out from under it. Reproduced live (`pthread_mutex_lock(&req->lock)` failing with EINVAL
+//- a destroyed mutex) once the watchdog window was lengthened for testing, which widened the odds
+//of hitting it, though the race existed at any timeout length. Fixed by making the single shared
+//list lock the ONLY synchronization point: a watchdog holds it across its entire
+//"decide-then-unlink-then-fire" sequence, so devctrl_watchdog_cancel either sets `cancelled` before
+//that sequence starts (watchdog then skips firing) or blocks until the sequence - including the
+//WdfRequestComplete call - has fully finished before it can even search the list. Either way,
+//tudor_cleanup's destroy (which always runs after devctrl_watchdog_cancel returns) is safe.
+struct devctrl_watchdog_ctx {
+    struct devctrl_watchdog_ctx *prev, *next;
+    bool cancelled;
+    struct winwdf_request *req;
+};
+
+static pthread_mutex_t g_watchdog_list_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_watchdog_list_cond = PTHREAD_COND_INITIALIZER;
+static struct devctrl_watchdog_ctx *g_watchdog_list_head = NULL;
+
+static void devctrl_watchdog_cancel(struct winwdf_request *req) {
+    cant_fail_ret(pthread_mutex_lock(&g_watchdog_list_lock));
+    for(struct devctrl_watchdog_ctx *ctx = g_watchdog_list_head; ctx; ctx = ctx->next) {
+        if(ctx->req != req) continue;
+        ctx->cancelled = true;
+        cant_fail_ret(pthread_cond_broadcast(&g_watchdog_list_cond));
+        break;
+    }
+    cant_fail_ret(pthread_mutex_unlock(&g_watchdog_list_lock));
+}
+
+extern void win_init_tib();
+
+static void *devctrl_watchdog_thread(void *arg) {
+    struct devctrl_watchdog_ctx *ctx = (struct devctrl_watchdog_ctx*) arg;
+    win_init_tib(); //WdfRequestComplete below runs driver callbacks - see winapi/io.c's ovlp_cb_thread_func
+
+    struct timespec deadline;
+    cant_fail_ret(clock_gettime(CLOCK_REALTIME, &deadline));
+    deadline.tv_sec += atoi(getenv("TUDOR_WATCHDOG_SEC"));
+
+    cant_fail_ret(pthread_mutex_lock(&g_watchdog_list_lock));
+    int wait_err = 0;
+    while(!ctx->cancelled && wait_err == 0) wait_err = pthread_cond_timedwait(&g_watchdog_list_cond, &g_watchdog_list_lock, &deadline);
+
+    //Unlink and (if not cancelled) fire while STILL holding the list lock - see the comment above
+    //for why this is required for correctness, not just tidiness.
+    if(ctx->prev) ctx->prev->next = ctx->next;
+    else g_watchdog_list_head = ctx->next;
+    if(ctx->next) ctx->next->prev = ctx->prev;
+    bool cancelled = ctx->cancelled;
+    if(!cancelled) WdfRequestComplete(NULL, (WDFOBJECT) ctx->req, 0xC00000B5 /* STATUS_IO_TIMEOUT */);
+    cant_fail_ret(pthread_mutex_unlock(&g_watchdog_list_lock));
+
+    free(ctx);
+    return NULL;
+}
+
 static NTSTATUS tudor_devctrl(struct tudor_device *device, OVERLAPPED *ovlp, ULONG code, void *in_buf, size_t in_size, void *out_buf, size_t out_size, struct winwdf_request **req) {
     if(LOG_LEVEL <= LOG_VERBOSE) {
         cant_fail_ret(pthread_mutex_lock(&LOG_LOCK));
@@ -34,6 +101,10 @@ static NTSTATUS tudor_devctrl(struct tudor_device *device, OVERLAPPED *ovlp, ULO
         cant_fail_ret(pthread_mutex_unlock(&LOG_LOCK));
     }
 
+    //Clear the fake "capture in progress" handle a previous StartCapture left behind - see
+    //driver.c's tudor_reset_ctx100 and FINDINGS.md.
+    if(code == 0x440014) tudor_reset_ctx100();
+
     //Start the request
     struct winmodule *mod = winmodule_get_cur();
     winmodule_set_cur(&tudor_driver_dll->module);
@@ -41,7 +112,31 @@ static NTSTATUS tudor_devctrl(struct tudor_device *device, OVERLAPPED *ovlp, ULO
     winmodule_set_cur(mod);
 
     //Add callback
-    if(status == STATUS_SUCCESS) winwdf_add_request_callback(*req, (winwdf_request_cb_fnc*) req_cb, ovlp);
+    if(status == STATUS_SUCCESS) {
+        winwdf_add_request_callback(*req, (winwdf_request_cb_fnc*) req_cb, ovlp);
+
+        //Debugging aid only, opt-in via TUDOR_WATCHDOG_SEC: real captures legitimately wait (with no
+        //timeout) for a finger touch, so a default watchdog would kill every real capture.
+        //tudor_cleanup cancels it properly before the request object is destroyed - see
+        //devctrl_watchdog_thread's own comment for the use-after-free this replaced.
+        if(getenv("TUDOR_WATCHDOG_SEC") && atoi(getenv("TUDOR_WATCHDOG_SEC")) > 0) {
+            struct devctrl_watchdog_ctx *wd_ctx = (struct devctrl_watchdog_ctx*) malloc(sizeof(struct devctrl_watchdog_ctx));
+            if(!wd_ctx) { perror("Couldn't allocate devctrl watchdog context"); abort(); }
+            wd_ctx->prev = wd_ctx->next = NULL;
+            wd_ctx->cancelled = false;
+            wd_ctx->req = *req;
+
+            cant_fail_ret(pthread_mutex_lock(&g_watchdog_list_lock));
+            wd_ctx->next = g_watchdog_list_head;
+            if(g_watchdog_list_head) g_watchdog_list_head->prev = wd_ctx;
+            g_watchdog_list_head = wd_ctx;
+            cant_fail_ret(pthread_mutex_unlock(&g_watchdog_list_lock));
+
+            pthread_t wd_thread;
+            cant_fail_ret(pthread_create(&wd_thread, NULL, devctrl_watchdog_thread, wd_ctx));
+            cant_fail_ret(pthread_detach(wd_thread));
+        }
+    }
 
     return status;
 }
@@ -52,12 +147,21 @@ static NTSTATUS tudor_cancel(struct tudor_device *device, OVERLAPPED *ovlp, stru
 }
 
 static void tudor_cleanup(struct tudor_device *device, OVERLAPPED *ovlp, struct winwdf_request *req) {
+    devctrl_watchdog_cancel(req);
     winwdf_destroy_object((WDFOBJECT) req);
 }
+
+extern void winusb_set_active_device(libusb_device_handle *usb_dev);
 
 bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, struct tudor_device_state *state) {
     HRESULT hres;
     NTSTATUS status;
+
+    //The driver talks to the sensor directly via the real WinUsb API (LoadLibraryA("WINUSB.DLL")
+    //+ GetProcAddress) - see winapi/winusb.c - which needs to know which physical device to
+    //operate on since WinUsb_Initialize's DeviceHandle argument doesn't map to anything
+    //meaningful in this bridge (see winusb.c's own comment for why).
+    winusb_set_active_device(usb_dev);
 
     device->state = state ? *state : (struct tudor_device_state) {0};
     device->enrolling = false;
@@ -74,7 +178,10 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
 
     //Open the device through the driver
     device->reg_key = winreg_open_key(device, "HKEY_LOCAL_MACHINE\\Tudor\\Device");
-    if((status = winwdf_add_device(tudor_wdf_driver, device->reg_key, usb_dev, &device->wdf_device)) != 0) {
+    status = tudor_using_com_activation
+        ? tudor_com_add_device(device->reg_key, usb_dev, &device->wdf_device)
+        : winwdf_add_device(tudor_wdf_driver, device->reg_key, usb_dev, &device->wdf_device);
+    if(status != 0) {
         log_error("Error adding WDF device: 0x%x!", status);
         return false;
     }
@@ -112,10 +219,19 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
     WINBIO_CALL_PIPELINE(tudor_engine_adapter->Attach, device->pipeline);
     WINBIO_CALL_PIPELINE(tudor_storage_adapter->Attach, device->pipeline);
 
+    //Adapter DLL's own StartCapture gates real work behind EngineContext+0x8c==1 (never set
+    //correctly on this host - see FINDINGS.md), patched directly here.
+    if(device->pipeline->EngineContext) {
+        *(uint32_t*) ((uint8_t*) device->pipeline->EngineContext + 0x8c) = 1;
+        log_debug("DIAG: patched EngineContext %p +0x8c = 1", device->pipeline->EngineContext);
+    } else {
+        log_debug("DIAG: EngineContext is NULL after Attach - couldn't patch +0x8c!");
+    }
+
     log_debug("Initializing pipeline interfaces...");
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->PipelineInit, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_engine_adapter->PipelineInit, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->PipelineInit, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_sensor_adapter, PipelineInit, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_engine_adapter, PipelineInit, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_storage_adapter, PipelineInit, device->pipeline);
 
     //Reset the sensor
     log_debug("Resetting sensor...");
@@ -123,17 +239,43 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
 
     //Activate the pipeline
     log_debug("Activating pipeline...");
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Activate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_engine_adapter->Activate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->Activate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_sensor_adapter, Activate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_engine_adapter, Activate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_storage_adapter, Activate, device->pipeline);
 
-    //Check the sensor status
+    //Poll briefly since BUSY right after Reset()/Activate() is transient - but treat a lingering
+    //BUSY as non-fatal (log and continue) rather than hard-failing; see FINDINGS.md.
     log_debug("Checking sensor status...");
     ULONG sensor_status = WINBIO_SENSOR_FAILURE;
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->QueryStatus, device->pipeline, &sensor_status)
-    if(sensor_status != WINBIO_SENSOR_READY) {
-        log_error("Sensor didn't return ready status! [status 0x%x]", status);
+    for(int attempt = 0; attempt < 10; attempt++) {
+        WINBIO_CALL_PIPELINE(tudor_sensor_adapter->QueryStatus, device->pipeline, &sensor_status)
+        if(sensor_status == WINBIO_SENSOR_READY || sensor_status != WINBIO_SENSOR_BUSY) break;
+        cant_fail(usleep(200000));
+    }
+    if(sensor_status == WINBIO_SENSOR_BUSY) {
+        log_warn("Sensor reported BUSY at open time - continuing anyway (status re-checked before capture).");
+    } else if(sensor_status != WINBIO_SENSOR_READY) {
+        log_error("Sensor didn't return ready status! [status 0x%x]", sensor_status);
         return false;
+    }
+
+    //Legacy only (TUDOR_LEGACY_CTX_PATCH): throwaway StartCapture so driver.c's legacy
+    //tudor_hook_thread_create patch applies before any real user-requested operation runs. Not
+    //needed - and harmful, it consumes the driver's real ctx->field_0x100 - now that the driver sets
+    //up its own capture context. See FINDINGS.md.
+    if(getenv("TUDOR_LEGACY_CTX_PATCH")) {
+        OVERLAPPED *warmup_ovlp;
+        HRESULT warmup_hres = tudor_sensor_adapter->StartCapture(device->pipeline, WINBIO_PURPOSE_IDENTIFY, &warmup_ovlp);
+        if(warmup_hres == ERROR_SUCCESS) {
+            winio_wait_overlapped(warmup_ovlp, NULL);
+            ULONG reject_detail;
+            tudor_sensor_adapter->FinishCapture(device->pipeline, &reject_detail);
+        } else {
+            log_warn("Capture warm-up's StartCapture call itself failed: 0x%x (continuing anyway)", warmup_hres);
+        }
+
+        //Clear the fake "capture in progress" handle the warm-up left behind - see FINDINGS.md.
+        tudor_reset_ctx100();
     }
 
     return true;
@@ -146,15 +288,15 @@ bool tudor_close(struct tudor_device *device) {
 
     //Deactivate the pipeline
     log_debug("Deactivating pipeline...");
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Deactivate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_engine_adapter->Deactivate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->Deactivate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_sensor_adapter, Deactivate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_engine_adapter, Deactivate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_storage_adapter, Deactivate, device->pipeline);
 
     //Uninitialize the pipeline
     log_debug("Uninitializing pipeline interfaces...");
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->PipelineCleanup, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_engine_adapter->PipelineCleanup, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->PipelineCleanup, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_sensor_adapter, PipelineCleanup, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_engine_adapter, PipelineCleanup, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_storage_adapter, PipelineCleanup, device->pipeline);
 
     log_debug("Detaching interfaces from pipeline...");
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Detach, device->pipeline);
@@ -170,6 +312,7 @@ bool tudor_close(struct tudor_device *device) {
 
     //Remove the device
     winmodule_set_cur(&tudor_driver_dll->module);
+    if(tudor_using_com_activation) tudor_com_remove_device();
     winwdf_remove_device(device->wdf_device);
     winwdf_event_queue_flush();
     winhandle_destroy(device->reg_key);
@@ -467,6 +610,7 @@ bool tudor_identify(struct tudor_device *device, bool *retry, bool *found_match,
     }
 
     log_debug("Capturing sample...");
+
     OVERLAPPED *ovlp;
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->StartCapture, device->pipeline, WINBIO_PURPOSE_IDENTIFY, &ovlp);
 

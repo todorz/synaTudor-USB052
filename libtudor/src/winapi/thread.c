@@ -4,6 +4,13 @@
 
 typedef DWORD __winfnc THREAD_START_ROUTINE(void *param);
 
+//Implemented in tudor/driver.c - lets driver-specific code inspect/patch a thread's context
+//right before it starts running, for the one specific known thread whose real work is gated on
+//state this bridge never otherwise constructs (see tudor_hook_thread_create's own comment).
+//Declared here directly (rather than pulling in tudor/internal.h) since this is a generic Win32
+//API implementation that shouldn't otherwise depend on the tudor-specific layer above it.
+void tudor_hook_thread_create(void *start_proc, void *param);
+
 #define CREATE_SUSPENDED 0x00000004
 
 struct win_thread {
@@ -40,12 +47,11 @@ static DWORD thread_wait(struct win_thread *thread, DWORD timeout) {
     if(timeout == INFINITE) {
         cant_fail_ret(pthread_join(thread->thread, NULL));
     } else {
-        struct timespec time;
-        time.tv_nsec = timeout * 10000000L;
-        time.tv_sec = timeout / 1000L;
-        int err = pthread_timedjoin_np(thread->thread, NULL, &time);
+        struct timespec deadline;
+        win_timeout_to_abstime(timeout, &deadline);
+        int err = pthread_timedjoin_np(thread->thread, NULL, &deadline);
         if(err == ETIMEDOUT) return WAIT_TIMEOUT;
-        cant_fail(err);
+        cant_fail_ret(err);
     }
 
     thread->has_detached = TRUE;
@@ -94,6 +100,8 @@ __winfnc HANDLE CreateThread(void *security_attrs, SIZE_T stack_size, THREAD_STA
     thread->start_proc = start_proc;
     thread->start_param = param;
 
+    tudor_hook_thread_create((void*) start_proc, param);
+
     thread->handle = winhandle_create(thread, (winhandle_destr_fnc*) thread_destr);
 
     //Create the actual thread
@@ -134,3 +142,15 @@ __winfnc void ExitThread(DWORD exit_code) {
     pthread_exit((void*) (uintptr_t) exit_code);
 }
 WINAPI(ExitThread)
+
+//A pthread can't be safely killed from the outside (and pthread_cancel would try to unwind through
+//Windows-ABI frames without unwind info), so this only reports the request. The driver uses it as
+//a last-resort fallback during teardown after asking the thread to quit (PostThreadMessageW).
+__winfnc BOOL TerminateThread(HANDLE handle, DWORD exit_code) {
+    log_warn("TerminateThread(%p, %u) called - not supported, leaving the thread running", (void*) handle, (unsigned) exit_code);
+    return TRUE;
+}
+WINAPI(TerminateThread)
+
+__winfnc HANDLE GetCurrentThread() { return (HANDLE) -2; } //Pseudo-handle, like the real thing
+WINAPI(GetCurrentThread)

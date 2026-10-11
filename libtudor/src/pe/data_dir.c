@@ -3,6 +3,25 @@
 #include <tudor/log.h>
 #include "internal.h"
 
+//Only the SecurityCookie field (offset 0x58 in IMAGE_LOAD_CONFIG_DIRECTORY64) is parsed here.
+//Real Windows loaders populate this field with real entropy before any code in the image runs,
+//which is why __security_init_cookie's own entropy-gathering fallback is rarely exercised in
+//practice; without replicating that pre-population, a GS-protected function whose prologue runs
+//before __security_init_cookie (and epilogue after) can observe the global cookie change out from
+//under it and spuriously fail its own stack-cookie check.
+static void pe_parse_load_config_dir(struct pe_file *pe, struct pe_data_dir *dir) {
+    pe->security_cookie_rva = 0;
+    if(dir->size < 0x60) return;
+
+    uint32_t struct_size = le32toh(*(uint32_t*) dir->data);
+    if(struct_size < 0x60) return;
+
+    uint64_t security_cookie_va = le64toh(*(uint64_t*) (dir->data + 0x58));
+    if(security_cookie_va < pe->desired_base || security_cookie_va - pe->desired_base >= (uint32_t) pe->image_size) return;
+
+    pe->security_cookie_rva = (uint32_t) (security_cookie_va - pe->desired_base);
+}
+
 bool pe_parse_data_dirs(struct pe_file *pe) {
     if(pe->num_data_dirs * sizeof(struct PEs_data_dir) > pe->opt_header_size - sizeof(struct PEs_opt_header)) {
         log_error("PE file has too many data directory entries!");
@@ -37,6 +56,7 @@ bool pe_parse_data_dirs(struct pe_file *pe) {
             case PE_DATA_DIR_EXCEPTION: { if(!pe_parse_exception_dir(pe, dir))  return false; } break;
             case PE_DATA_DIR_RELOC:     { if(!pe_parse_reloc_dir(pe, dir))      return false; } break;
             case PE_DATA_DIR_TLS:       { if(!pe_parse_tls_dir(pe, dir))        return false; } break;
+            case PE_DATA_DIR_LOAD_CONFIG: { pe_parse_load_config_dir(pe, dir); } break;
         }
     }
 

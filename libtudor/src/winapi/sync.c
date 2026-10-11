@@ -52,6 +52,13 @@ __winfnc void InitializeCriticalSection(CRITICAL_SECTION *sect) {
 }
 WINAPI(InitializeCriticalSection)
 
+__winfnc BOOL InitializeCriticalSectionAndSpinCount(CRITICAL_SECTION *sect, DWORD spinCount) {
+    //Real Windows always succeeds here, regardless of the InitializeCriticalSectionEx result
+    InitializeCriticalSectionEx(sect, spinCount, 0);
+    return TRUE;
+}
+WINAPI(InitializeCriticalSectionAndSpinCount)
+
 __winfnc void DeleteCriticalSection(CRITICAL_SECTION* sect) {
     //Destroy the mutex
     cant_fail_ret(pthread_mutex_destroy((pthread_mutex_t*) sect->LockSemaphore));
@@ -59,24 +66,16 @@ __winfnc void DeleteCriticalSection(CRITICAL_SECTION* sect) {
 }
 WINAPI(DeleteCriticalSection)
 
+//LockCount/RecursionCount/OwningThread are intentionally left untouched - nothing in this codebase
+//reads them back, the real (recursive) pthread mutex already tracks its own recursion internally,
+//and writing to them corrupted an unrelated driver object that happened to alias this memory - see
+//FINDINGS.md.
 __winfnc void EnterCriticalSection(CRITICAL_SECTION *sect) {
-    //Lock the mutex
     cant_fail_ret(pthread_mutex_lock((pthread_mutex_t*) sect->LockSemaphore));
-
-    if(sect->RecursionCount++ == 0) {
-        sect->LockCount = 1;
-        sect->OwningThread = (HANDLE) pthread_self();
-    }
 }
 WINAPI(EnterCriticalSection)
 
 __winfnc void LeaveCriticalSection(CRITICAL_SECTION *sect) {
-    if(--sect->RecursionCount == 0) {
-        sect->LockCount = 0;
-        sect->OwningThread = NULL;
-    }
-
-    //Unlock the mutex
     cant_fail_ret(pthread_mutex_unlock((pthread_mutex_t*) sect->LockSemaphore));
 }
 WINAPI(LeaveCriticalSection)
@@ -116,18 +115,17 @@ static DWORD evt_wait(struct sync_event *evt, DWORD timeout) {
     DWORD res = 0;
     cant_fail_ret(pthread_mutex_lock(&evt->lock));
 
-    //Wait for the event
+    //Wait for the event (the deadline is computed once, so spurious wakeups don't extend it)
+    struct timespec deadline;
+    if(timeout != INFINITE) win_timeout_to_abstime(timeout, &deadline);
     while(!evt->state) {
         if(timeout != INFINITE) {
-            struct timespec time;
-            time.tv_nsec = timeout * 10000000L;
-            time.tv_sec = timeout / 1000L;
-            int err = pthread_cond_timedwait(&evt->cond, &evt->lock, &time);
+            int err = pthread_cond_timedwait(&evt->cond, &evt->lock, &deadline);
             if(err == ETIMEDOUT) {
                 res = WAIT_TIMEOUT;
                 break;
             }
-            cant_fail(err);
+            cant_fail_ret(err);
         } else cant_fail_ret(pthread_cond_wait(&evt->cond, &evt->lock));
     }
 

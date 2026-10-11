@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <tudor/log.h>
 #include "pe/pe.h"
 #include "winapi/api.h"
@@ -66,6 +67,18 @@ bool load_dll(struct dll_image *dll, const char *name, uint8_t *data, uint32_t s
 
     //Copy data
     pe_copy_mem(&pe, 0, pe.image_size, image_mem);
+
+    //Copy the raw PE headers (DOS/COFF/optional headers + section table), which live before
+    //the first section's RVA and thus aren't covered by any pe_section, so pe_copy_mem leaves
+    //them zeroed. Real Windows binaries frequently read their own headers back out of memory
+    //(e.g. to locate IMAGE_NT_HEADERS via e_lfanew), so this region has to be populated too.
+    uint32_t header_size = pe.image_size;
+    for(int i = 0; i < pe.num_sects; i++) {
+        if(pe.sections[i].mem_off < header_size) header_size = pe.sections[i].mem_off;
+    }
+    if(header_size > (uint32_t) size) header_size = size;
+    memcpy(image_mem, data, header_size);
+
     log_debug("Copied image memory to mapping at %p - %p", image_mem, image_mem + pe.image_size);
 
     //Resolve imports
@@ -106,11 +119,34 @@ bool load_dll(struct dll_image *dll, const char *name, uint8_t *data, uint32_t s
     }
     log_debug("Applied %d relocations", pe.num_relocs);
 
+    //Pre-populate the security cookie (see pe_parse_load_config_dir for why this matters):
+    //real Windows loaders do this before any code in the image runs, avoiding a window where
+    //a GS-protected function's prologue can observe a different cookie than its epilogue does.
+    if(pe.security_cookie_rva) {
+        uint64_t cookie;
+        if(getrandom(&cookie, sizeof(cookie), 0) != sizeof(cookie)) cookie = (uint64_t) (uintptr_t) image_mem;
+        //__security_check_cookie verifies (in addition to the raw value matching) that the
+        //cookie's top 16 bits are zero, matching the masking real __security_init_cookie applies
+        //to its own computed value - an unmasked value fails that shape check even when it
+        //otherwise matches perfectly between a function's prologue and epilogue.
+        cookie &= 0xffffffffffffull;
+        if(cookie == 0 || cookie == 0x2b992ddfa232) cookie ^= 0x1;
+        *((uint64_t*) (image_mem + pe.security_cookie_rva)) = cookie;
+        log_debug("Pre-initialized security cookie at RVA 0x%x", pe.security_cookie_rva);
+    }
+
     //Apply section protections
     log_debug("Applying memory protections to image");
 
     if(mprotect(image_mem, pe.image_size, PROT_NONE)) {
         perror("Could't apply default image protection");
+        return false;
+    }
+
+    //The PE header region precedes the first section and is never covered by the section
+    //protection loop below, but real PE images always keep it readable.
+    if(header_size > 0 && mprotect(image_mem, header_size, PROT_READ)) {
+        perror("Couldn't apply image header protection");
         return false;
     }
 
@@ -161,10 +197,16 @@ void destroy_dll(struct dll_image *dll) {
     dll->base_addr = NULL;
 }
 
-void *find_dll_export(struct dll_image *dll, const char *name) {
+void *find_dll_export_optional(struct dll_image *dll, const char *name) {
     for(int i = 0; i < dll->num_exports; i++) {
         if(strcmp(dll->exports[i].name, name) == 0) return dll->exports[i].addr;
     }
+    return NULL;
+}
+
+void *find_dll_export(struct dll_image *dll, const char *name) {
+    void *addr = find_dll_export_optional(dll, name);
+    if(addr) return addr;
 
     log_error("Couldn't find DLL export '%s'!", name);
     abort();

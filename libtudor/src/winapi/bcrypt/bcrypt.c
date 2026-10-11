@@ -304,6 +304,25 @@ __winfnc NTSTATUS BCryptDestroyKey(struct bcrypt_key *key) {
 }
 WINAPI(BCryptDestroyKey);
 
+//Real BCryptEncrypt/BCryptDecrypt update the caller's pbIV buffer in place after a CBC/CFB call,
+//so a caller can chain multiple calls over one larger message using the same iv variable without
+//managing a persistent cipher object itself (this is CNG's replacement for the object-persisted
+//chaining state CAPI's CryptEncrypt used) - confirmed via real BCryptEncrypt documentation/behavior
+//reports. This was previously not implemented at all: iv was passed through read-only and never
+//written back, so any multi-call CBC/CFB chain silently used the SAME (wrong, un-chained) IV for
+//every call after the first - a silent data-corruption bug, not a crash, exactly the class of bug
+//already found and fixed in a sibling Synaptics Tudor driver's CAPI path (see FINDINGS.md). GCM is
+//deliberately excluded - its IV/nonce handling is already special-cased in aes.c and doesn't chain
+//this way.
+static bool chaining_mode_needs_iv_update(struct bcrypt_object *prov_obj) {
+    struct bcrypt_property *chain_prop = bcrypt_find_obj_prop(prov_obj, "ChainingMode");
+    if(!chain_prop) return false;
+    char *chain_mode = winstr_to_str((const char16_t*) chain_prop->val);
+    bool needs_update = strcmp(chain_mode, "ChainingModeCBC") == 0 || strcmp(chain_mode, "ChainingModeCFB") == 0;
+    free(chain_mode);
+    return needs_update;
+}
+
 __winfnc NTSTATUS BCryptEncrypt(struct bcrypt_key *key, UCHAR *in, ULONG in_size, void *pad_info, UCHAR *iv, ULONG iv_size, UCHAR *out, ULONG out_size, ULONG *res_size, ULONG flags) {
     if(!key->algo->encrypt) return WINERR_SET_CODE;
     if(flags) {
@@ -313,7 +332,12 @@ __winfnc NTSTATUS BCryptEncrypt(struct bcrypt_key *key, UCHAR *in, ULONG in_size
 
     size_t sz = out_size;
     NTSTATUS status = key->algo->encrypt(key->algo, key->key_data, &key->algo_wrap->obj, pad_info, iv, iv_size, in, in_size, out, &sz);
-    if(status == STATUS_SUCCESS) *res_size = (ULONG) sz;
+    if(status == STATUS_SUCCESS) {
+        *res_size = (ULONG) sz;
+        if(iv && sz >= iv_size && chaining_mode_needs_iv_update(&key->algo_wrap->obj)) {
+            memcpy(iv, out + sz - iv_size, iv_size);
+        }
+    }
     return status;
 }
 WINAPI(BCryptEncrypt)
@@ -325,9 +349,18 @@ __winfnc NTSTATUS BCryptDecrypt(struct bcrypt_key *key, UCHAR *in, ULONG in_size
         return WINERR_SET_CODE;
     }
 
+    //The updated chaining IV must be captured from the ciphertext INPUT before decrypting, since
+    //decryption may write its output over the same buffer as the input (in-place decrypt).
+    UCHAR next_iv[64];
+    bool update_iv = iv && in_size >= iv_size && iv_size <= sizeof(next_iv) && chaining_mode_needs_iv_update(&key->algo_wrap->obj);
+    if(update_iv) memcpy(next_iv, in + in_size - iv_size, iv_size);
+
     size_t sz = out_size;
     NTSTATUS status = key->algo->decrypt(key->algo, key->key_data, &key->algo_wrap->obj, pad_info, iv, iv_size, in, in_size, out, &sz);
-    if(status == STATUS_SUCCESS) *res_size = (ULONG) sz;
+    if(status == STATUS_SUCCESS) {
+        *res_size = (ULONG) sz;
+        if(update_iv) memcpy(iv, next_iv, iv_size);
+    }
     return status;
 }
 WINAPI(BCryptDecrypt)

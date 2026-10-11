@@ -42,12 +42,17 @@ NTSTATUS winwdf_open_device(struct winwdf_device *device, struct winwdf_file **o
     });
     wdf_start_request(req, &file->object, -1);
 
-    //Call callbacks
+    //Call callbacks. Real WDF auto-completes Create requests with STATUS_SUCCESS when the driver
+    //hasn't registered a dispatch queue or an EvtDeviceFileCreate callback for them - without this,
+    //a driver that (legitimately) never registers either would leave this request pending forever,
+    //deadlocking winwdf_wait_request below.
     WDF_FILEOBJECT_CONFIG *cfg = wdf_get_fs_config(device);
     if(create_queue) {
         wdf_queue_create(create_queue, req);
-    } else if(cfg) {
-        if(cfg->EvtDeviceFileCreate) cfg->EvtDeviceFileCreate((WDFOBJECT) device, (WDFOBJECT) req, &file->object);
+    } else if(cfg && cfg->EvtDeviceFileCreate) {
+        cfg->EvtDeviceFileCreate((WDFOBJECT) device, (WDFOBJECT) req, &file->object);
+    } else {
+        wdf_complete_request(req, STATUS_SUCCESS, NULL);
     }
 
     NTSTATUS status = winwdf_wait_request(req);

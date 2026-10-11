@@ -152,6 +152,7 @@ __winfnc LONG RegQueryValueExA(HANDLE hkey, const char *val_name, DWORD *resv, D
     bool suc;
     if(data) suc = winreg_query_val(hkey, val_name, data, &data_sz, &out_type);
     else suc = winreg_query_val(hkey, val_name, NULL, &data_sz, &out_type);
+    log_debug("DIAG: RegQueryValueExA val_name='%s' data=%p -> suc=%d data_sz=0x%zx", val_name, data, suc, data_sz);
 
     *data_size = (DWORD) data_sz;
 
@@ -168,6 +169,7 @@ __winfnc LONG RegQueryValueExW(HANDLE hkey, const char16_t *val_name, DWORD *res
     bool suc;
     if(data) suc = winreg_query_val(hkey, val_cname, data, &data_sz, &out_type);
     else suc = winreg_query_val(hkey, val_cname, NULL, &data_sz, &out_type);
+    log_debug("DIAG: RegQueryValueExW val_name='%s' data=%p -> suc=%d data_sz=0x%zx", val_cname, data, suc, data_sz);
 
     *data_size = (DWORD) data_sz;
     free(val_cname);
