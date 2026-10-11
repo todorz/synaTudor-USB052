@@ -94,18 +94,6 @@ __winfnc void *HeapAlloc(HANDLE heap, DWORD flags, SIZE_T size) {
 }
 WINAPI(HeapAlloc)
 
-//The driver's own AddRef/Release-style object lifecycles don't match this project's fake stand-ins
-//closely enough for a real free() here to be safe (see driver.c's fake quine objects): first found
-//as a straight double-free abort (the same pointer reaching HeapFree twice - fixed by tracking freed
-//pointers and no-opping repeats), but that only masked a deeper problem, confirmed live afterward -
-//the *first* free() genuinely succeeds and glibc's tcache "safe linking" then writes an obfuscated
-//freelist pointer (`address >> 12`, matched exactly live) into the freed chunk's own first 8 bytes.
-//Something else (ctx->field_0x100's real object, via its own field_0x8) still holds a live reference
-//to that same memory and reads it later, expecting it to remain the object this project set up -
-//a genuine use-after-free once anything actually frees it. So HeapFree is now a permanent no-op:
-//nothing this project hands the driver via HeapAlloc is ever actually released for the life of the
-//process. Trades unbounded leaking (fine for a short CLI test run) for never corrupting memory
-//something else still depends on. See FINDINGS.md.
 __winfnc BOOL HeapFree(HANDLE heap, DWORD flags, void *mem) {
     if(heap != PROC_HEAP_HANDLE) {
         log_warn("HeapAlloc called with invalid heap handle");
@@ -113,6 +101,7 @@ __winfnc BOOL HeapFree(HANDLE heap, DWORD flags, void *mem) {
         return FALSE;
     }
 
+    free(mem);
     return TRUE;
 }
 WINAPI(HeapFree)
