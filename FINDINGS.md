@@ -3246,3 +3246,20 @@ Notes: enrolling needs polkit authorization (`net.reactivated.fprint.device.enro
 so without a polkit agent (e.g. bare Hyprland) use `sudo fprintd-enroll -f
 <finger> <user>`. Running `sudo ninja install` leaves root-owned files in
 `build/`; `chown` it back afterwards.
+
+### tudor-host aborted on duplicate enrollments
+
+Enrolling a finger that the engine flags as a duplicate made `tudor_host`
+abort. fprintd then only reported "Tudor host process died" and, until
+restarted, `enroll-disconnected`. `tudor_enroll_commit` returns `false` *and*
+sets `is_duplicate` for duplicates, but `handler.c` checked `!commit` first and
+`abort()`ed, so its "overwrite duplicate" branch was unreachable. The enroll
+response now carries `duplicate`/`failed` flags: the host discards the
+enrollment, stays alive, and the TOD module reports
+`FP_DEVICE_ERROR_DATA_DUPLICATE` (fprintd: `enroll-duplicate`) or a general
+error. Verified with a real duplicate finger.
+
+Install note: copying a build-tree `tudor_host` into `/sbin/tudor` doesn't
+work, because its RUNPATH points at the build directory ("libtudor.so: cannot
+open shared object file"). Use `sudo meson install -C build --no-rebuild`, and
+configure the build dir with the same meson that root uses.
