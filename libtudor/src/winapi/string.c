@@ -44,8 +44,7 @@ WINAPI(GetCPInfo)
 //RetrieveDeviceName string, then wildcard-matches the *result* against "usb" to decide whether to
 //do real work at all - with the old single-character behavior, that "result" was just the first
 //character followed by uninitialized stack garbage, which can never match "usb" regardless of
-//what the real wide string says. See FINDINGS.md "Root-caused: WideCharToMultiByte only
-//converted one character" for the full trace. This is a general-purpose bug independent of that
+//what the real wide string says. See FINDINGS.md. This is a general-purpose bug independent of that
 //one call site - fixing it properly (real Win32 semantics: cchWideChar/cbMultiByte == -1 means
 //"NUL-terminated, measure/convert including the terminator"; cbMultiByte/cchWideChar == 0 means
 //"just return the required size, don't write") rather than special-casing the one call site that

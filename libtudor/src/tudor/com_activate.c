@@ -51,11 +51,11 @@ static const GUID g_iid_ipnp_callback_hardware = DEFINE_GUID(51433bd3, c7c1, 4bd
 static const GUID g_iid_ipnp_callback = DEFINE_GUID(27c32374, cc45, 4840, 857e, 8e5ef7c0ebff);
 //IWDFUsbTargetFactory - the documented UMDF 1.x mechanism for USB access (QueryInterface on the
 //device object, then CreateUsbTargetDevice). Confirmed live this driver never actually requests
-//it (see FINDINGS.md's "capture worker thread never completes" investigation) - wired up here
+//it (see FINDINGS.md) - wired up here
 //anyway on the chance some as-yet-unfound precondition is what's actually gating the attempt, not
 //the interface's absence. Real vtable layouts below verified directly against wudfusb.h's raw
-//flattened C-style vtable structs (not a summarized/renumbered fetch - see FINDINGS.md's slot-42
-//postmortem for why that distinction matters).
+//flattened C-style vtable structs (not a summarized/renumbered fetch, whose numbering
+//can be off by one).
 static const GUID g_iid_iwdf_usb_target_factory = DEFINE_GUID(3f7becf9, 3a65, 4348, a4f3, 339d5734a9c6);
 
 //IWDFPropertyStoreFactory - found live tracing the exact same "WinUsb_Initialize succeeds, then a
@@ -504,8 +504,8 @@ __winfnc static void com_get_default_io_target(struct com_obj *self, struct com_
 //IWDFNamedPropertyStore::GetNamedValue (slot 3 - QueryInterface=0, AddRef=1, Release=2 - per the
 //real wudfddi.h vtable). Backing object for IWDFDevice::RetrieveDevicePropertyStore below.
 //
-//Found live while tracing the "PairingContext" singleton constructor's crash (see FINDINGS.md
-//"Traced the singleton's missing +0x8 to its real root cause" and its follow-up): the driver
+//Found live while tracing the "PairingContext" singleton constructor's crash (see FINDINGS.md, COM
+//bridge): the driver
 //really does call GetNamedValue("PairingContext", &pv) as part of deciding whether a stored
 //pairing context already exists. This project's generic stub answers S_OK without ever touching
 //the caller's PROPVARIANT*, which - critically - is a *second*, independent instance of the same
@@ -586,7 +586,7 @@ static struct com_obj *get_property_store_factory_facade(void) {
 
 //IWDFDevice::RetrieveDeviceInstanceId (slot 10, same wudfddi.h vtable-counting as the rest of this
 //interface). Found live tracing the "PairingContext" singleton constructor's own gate check (see
-//FINDINGS.md "Traced the singleton's missing +0x8 to its real root cause"): it calls a generic
+//FINDINGS.md, COM bridge): it calls a generic
 //wildcard-match helper against the literal pattern `"usb"`, comparing it against a field of a
 //local struct this project has never populated - device_obj's own vtable slot 10 was still the
 //generic stub, so any driver code calling RetrieveDeviceInstanceId got an empty string back,
@@ -621,7 +621,7 @@ __winfnc static HRESULT com_retrieve_device_instance_id(struct com_obj *self, ch
 
 //IWDFDevice::RetrieveDeviceName (slot 17, same wudfddi.h vtable-counting as GetDefaultIoTarget/
 //CreateIoQueue below). This is the real, concrete gate this whole investigation was looking for
-//(see FINDINGS.md "Found the actual gate..."): the driver's real IPnpCallbackHardware::
+//(see FINDINGS.md, "Activation and device setup"): the driver's real IPnpCallbackHardware::
 //OnPrepareHardware implementation calls this with pDeviceName=NULL as the standard Win32
 //"query the required buffer size first" pattern, and treats a *zero* returned length as "no name
 //available" - silently skipping all of its real hardware-initialization work (which a captured
@@ -630,12 +630,12 @@ __winfnc static HRESULT com_retrieve_device_instance_id(struct com_obj *self, ch
 //pdwDeviceNameLength, which stayed at the caller's own zero-initialized value - not a crash, just
 //a silently-taken "nothing to do here" branch.
 //
-//CONTENT MATTERS, not just nonzero length: live-traced (see FINDINGS.md "Traced the crash all the
-//way back to our own RetrieveDeviceName fix") that this exact string, after being converted to
+//CONTENT MATTERS, not just nonzero length: live-traced (see FINDINGS.md, "Activation and device
+//setup") that this exact string, after being converted to
 //ANSI (WideCharToMultiByte) a few instructions later in the driver's own OnPrepareHardware body,
 //is directly wildcard-matched against the literal pattern "usb" - and the match result gates
 //whether a device-scoped singleton object's vtable gets populated at all (its "PairingContext"
-//teardown otherwise crashes on a still-null destructor slot - see the same FINDINGS.md section).
+//teardown otherwise crashes on a still-null destructor slot - see FINDINGS.md).
 //The original placeholder name didn't contain "usb", so the match failed every time. Must
 //contain "usb" (lowercase - the pattern is a literal lowercase string, not confirmed
 //case-insensitive) somewhere in the string.

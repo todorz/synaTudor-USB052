@@ -14,6 +14,22 @@ USE AT YOUR OWN RISK.
 
 **NOTE: The project should be fully functional right now, contrary to its earlier state. If there are any issues, please report them.**
 
+## 06cb:0082 (USB052 driver)
+This fork targets the 06cb:0082 sensor using Microsoft's USB052 driver package
+(`synaWudfBioUsb52.dll`, a legacy UMDF 1.x COM driver). Enroll, identify and
+verify work through both the CLI and fprintd, including wrong-finger
+rejection, cancellation and suspend/resume. See [FINDINGS.md](FINDINGS.md) for
+how the driver works and what the emulation layer needed.
+
+Notes:
+- Install with `sudo ninja install` / `sudo meson install -C build`, not by
+  copying binaries out of the build directory (`tudor_host`'s library path is
+  only fixed up on install). Restart fprintd afterwards
+  (`sudo systemctl stop fprintd tudor-host-launcher`; both start on demand).
+- `fprintd-enroll` needs polkit authorization. Without a polkit agent running
+  (e.g. on a bare Wayland compositor), use `sudo fprintd-enroll -f <finger> <user>`.
+- This driver needs about 12 good samples per enrollment.
+
 ## Structure
 This project is split over multiple folders, all providing different parts of
 the functionality:
