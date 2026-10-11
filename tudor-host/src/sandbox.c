@@ -140,6 +140,9 @@ static void setup_seccomp() {
 
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ALLOW, SCMP_SYS(getpid), 0));
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ALLOW, SCMP_SYS(gettid), 0));
+    //Read-only, non-sensitive: glibc's pthread_getattr_np (used to determine the real thread stack
+    //bounds for NT_TIB.StackBase/StackLimit) calls this internally.
+    cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ALLOW, SCMP_SYS(sched_getaffinity), 0));
 
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0));
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 1, SCMP_A3_32(SCMP_CMP_MASKED_EQ, MAP_ANONYMOUS, MAP_ANONYMOUS)));
@@ -192,6 +195,13 @@ static void setup_seccomp() {
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(open), 0));
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(openat), 0));
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(openat2), 0));
+    //Same denial pattern as open/openat above - the driver's CreateDirectoryA is expected to handle
+    //a failed mkdir gracefully (real storage goes through the IPC pairing-data messages, not direct
+    //filesystem access), so this should error out rather than get the sandboxed process killed.
+#ifdef SYS_mkdir
+    cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(mkdir), 0));
+#endif
+    cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(mkdirat), 0));
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 1, SCMP_A1_32(SCMP_CMP_EQ, F_GETFD)));
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 1, SCMP_A1_32(SCMP_CMP_EQ, F_SETFD)));
     cant_fail(seccomp_rule_add(scmp_ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 1, SCMP_A1_32(SCMP_CMP_EQ, F_GETFL)));

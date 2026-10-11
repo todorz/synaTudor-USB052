@@ -4,7 +4,9 @@
 #include <stdbool.h>
 #include "drivers_api.h"
 
-#define TUDOR_NUM_ENROLL_STAGES 8
+//The 06cb:0082 (USB052) driver's enrollment progress advances in steps of 1/12 (8, 16, 25, ... 100%)
+//per accepted sample - see FINDINGS.md. Samples beyond this many are reported as retries.
+#define TUDOR_NUM_ENROLL_STAGES 12
 
 typedef struct _IPCMessageBuf IPCMessageBuf;
 

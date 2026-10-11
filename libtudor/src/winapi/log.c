@@ -168,11 +168,13 @@ __winfnc DWORD RegisterTraceGuidsA(Wmidprequest *request_fnc, void *request_ctx,
     prov->guids = (struct trace_guid*) malloc(num_guids * sizeof(struct trace_guid));
     if(!prov->guids) return winerr_from_errno();
 
+    //Note: deliberately not writing back to trace_guids[i].RegHandle here. That field lives in
+    //memory the caller provided (commonly a stack-local array), and the caller doesn't need us to
+    //populate it for tracing/logging (a pure diagnostics feature) to work correctly on our side.
     for(int i = 0; i < num_guids; i++) {
         prov->guids[i].prov = prov;
         prov->guids[i].guid = trace_guids[i].Guid;
         prov->guids[i].handle = winhandle_create(&prov->guids[i], NULL);
-        trace_guids[i].RegHandle = prov->guids[i].handle;
     }
 
     *handle = winhandle_create(prov, (winhandle_destr_fnc*) trace_prov_destr);
@@ -200,3 +202,37 @@ __winfnc ULONG TraceMessage(HANDLE handle, ULONG flags, GUID *guid, USHORT num, 
     return ERROR_SUCCESS;
 }
 WINAPI(TraceMessage)
+
+//Windows Event Log - just enough to keep a driver's diagnostic logging calls from failing. Real
+//event delivery (to a system event log) isn't meaningful in this environment, so ReportEventA just
+//logs the message strings through our own logger instead of discarding them entirely.
+__winfnc HANDLE RegisterEventSourceA(const char *server_name, const char *source_name) {
+    return winhandle_create(NULL, NULL);
+}
+WINAPI(RegisterEventSourceA)
+
+__winfnc BOOL ReportEventA(HANDLE handle, WORD event_type, WORD category, DWORD event_id, void *user_sid, WORD num_strings, DWORD data_size, const char **strings, void *data) {
+    for(WORD i = 0; i < num_strings; i++) log_info("ReportEventA | %s", strings[i]);
+    return TRUE;
+}
+WINAPI(ReportEventA)
+
+__winfnc BOOL DeregisterEventSource(HANDLE handle) {
+    winhandle_destroy(handle);
+    return TRUE;
+}
+WINAPI(DeregisterEventSource)
+__winfnc void OutputDebugStringA(const char *str) {
+    if(str) log_debug("OutputDebugString | %s", str);
+}
+WINAPI(OutputDebugStringA)
+
+__winfnc void OutputDebugStringW(const char16_t *str) {
+    if(!str) return;
+    char buf[512];
+    size_t i = 0;
+    for(; str[i] && i < sizeof(buf) - 1; i++) buf[i] = str[i] < 0x80 ? (char) str[i] : '?';
+    buf[i] = 0;
+    log_debug("OutputDebugString | %s", buf);
+}
+WINAPI(OutputDebugStringW)

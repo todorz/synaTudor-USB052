@@ -1,3 +1,4 @@
+#include <limits.h>
 #include "internal.h"
 
 #define MAX_DEFAULTCHAR 2
@@ -34,33 +35,68 @@ __winfnc BOOL GetCPInfo(UINT code_page, CPINFO *info) {
 }
 WINAPI(GetCPInfo)
 
+//Both conversion functions below previously only converted a *single* character
+//(mbrtoc16/c16rtomb each consume/produce exactly one character per call) and returned
+//immediately, instead of looping over the whole string - silently truncating every multi-
+//character conversion to one character/byte and leaving the rest of the caller's output buffer
+//as whatever was already there. Found live tracing a real, otherwise-inexplicable crash deep in
+//OnPrepareHardware's own logic: it WideCharToMultiByte-converts this project's own
+//RetrieveDeviceName string, then wildcard-matches the *result* against "usb" to decide whether to
+//do real work at all - with the old single-character behavior, that "result" was just the first
+//character followed by uninitialized stack garbage, which can never match "usb" regardless of
+//what the real wide string says. See FINDINGS.md. This is a general-purpose bug independent of that
+//one call site - fixing it properly (real Win32 semantics: cchWideChar/cbMultiByte == -1 means
+//"NUL-terminated, measure/convert including the terminator"; cbMultiByte/cchWideChar == 0 means
+//"just return the required size, don't write") rather than special-casing the one call site that
+//happened to expose it.
 __winfnc int MultiByteToWideChar(UINT code_page, DWORD flags, const char *mbstr, int mblen, char16_t *wstr, int wlen) {
-    if(mblen < 0) mblen = strlen(mbstr);
+    if(mblen < 0) mblen = (int) strlen(mbstr) + 1;
     if(mblen == 0) {
         winerr_set();
         return 0;
     }
 
     mbstate_t mbs = {0};
-    int sz = mbrtoc16((0 < wlen) ? wstr : NULL, mbstr, mblen, &mbs);
-    if(sz > 0) return sz;
-    winerr_set();
-    return 0;
+    const char *src = mbstr;
+    size_t remaining = (size_t) mblen;
+    int out_count = 0;
+    while(remaining > 0) {
+        char16_t c16;
+        size_t consumed = mbrtoc16(&c16, src, remaining, &mbs);
+        if(consumed == (size_t) -1 || consumed == (size_t) -2) { winerr_set(); return 0; }
+        if(consumed == 0) consumed = 1; //mbrtoc16 returns 0 for an embedded NUL that was actually consumed
+        if(wlen > 0) {
+            if(out_count >= wlen) { winerr_set(); return 0; }
+            wstr[out_count] = c16;
+        }
+        out_count++;
+        src += consumed;
+        remaining -= consumed;
+    }
+    return out_count;
 }
 WINAPI(MultiByteToWideChar)
 
 __winfnc int WideCharToMultiByte(UINT code_page, DWORD flags, const char16_t *wstr, int wlen, char *mbstr, int mblen) {
-    if(wlen < 0) wlen = winstr_len(wstr);
+    if(wlen < 0) wlen = winstr_len(wstr) + 1;
     if(wlen == 0) {
         winerr_set();
         return 0;
     }
 
     mbstate_t mbs = {0};
-    int sz = c16rtomb((0 < mblen) ? mbstr : NULL, *wstr, &mbs);
-    if(sz > 0) return sz;
-    winerr_set();
-    return 0;
+    int out_count = 0;
+    for(int i = 0; i < wlen; i++) {
+        char buf[MB_LEN_MAX];
+        size_t sz = c16rtomb(buf, wstr[i], &mbs);
+        if(sz == (size_t) -1) { winerr_set(); return 0; }
+        if(mblen > 0) {
+            if(out_count + (int) sz > mblen) { winerr_set(); return 0; }
+            memcpy(mbstr + out_count, buf, sz);
+        }
+        out_count += (int) sz;
+    }
+    return out_count;
 }
 WINAPI(WideCharToMultiByte)
 

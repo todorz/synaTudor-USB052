@@ -18,6 +18,7 @@
 #define PE_DATA_DIR_EXCEPTION 3
 #define PE_DATA_DIR_RELOC 5
 #define PE_DATA_DIR_TLS 9
+#define PE_DATA_DIR_LOAD_CONFIG 10
 
 enum PEs_machine_type {
     PE_MACHINE_UNKNOWN = 0,

@@ -251,6 +251,8 @@ void wdf_configure_device_dispatch(struct winwdf_device *dev, struct winwdf_queu
     cant_fail_ret(pthread_mutex_unlock(&dev->queues_lock));
 }
 
+struct winwdf_driver *wdf_device_get_driver(struct winwdf_device *dev) { return dev->driver; }
+
 libusb_device_handle *wdf_get_libusb_device(struct winwdf_device *dev) { return dev->libusb_dev; }
 
 struct wdf_usb_device * wdf_get_usb_device(struct winwdf_device *dev) { return dev->usb_dev; }
@@ -334,6 +336,31 @@ WDFFUNC(WdfDeviceAssignS0IdleSettings, 16)
 
 __winfnc NTSTATUS WdfDeviceAssignSxWakeSettings(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *settings) { return STATUS_SUCCESS; }
 WDFFUNC(WdfDeviceAssignSxWakeSettings, 17)
+
+//PnP capability flags (surprise-removal-ok, no-UI-display, lock-on-wake, etc.) are pure metadata
+//consumed by the real Windows PnP manager's own power/removal-policy UI; not needed for device
+//functionality here.
+__winfnc void WdfDeviceSetPnpCapabilities(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *pnp_caps) {}
+WDFFUNC(WdfDeviceSetPnpCapabilities, 33)
+
+//Similarly, device-state flags (don't-report-failure, no-verify-power-policy-ownership, etc.) are
+//pure metadata for the real PnP manager.
+__winfnc void WdfDeviceSetDeviceState(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *device_state) {}
+WDFFUNC(WdfDeviceSetDeviceState, 13)
+
+//Device interface properties are pure metadata surfaced through the unified device property
+//model (e.g. for SetupAPI/PnP enumeration UI); not needed for device functionality here.
+__winfnc NTSTATUS WdfDeviceAssignInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, DWORD type, ULONG buf_len, void *buf) { return STATUS_SUCCESS; }
+WDFFUNC(WdfDeviceAssignInterfaceProperty, 50)
+
+//No interface properties are ever actually stored (WdfDeviceAssignInterfaceProperty above is a
+//no-op), so report "not found" here - real drivers are expected to handle a missing/unset
+//optional property gracefully, which is a more accurate response than fabricating STATUS_SUCCESS
+//with a bogus memory handle.
+__winfnc NTSTATUS WdfDeviceAllocAndQueryInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, DWORD pool_type, WDF_OBJECT_ATTRIBUTES *mem_attrs, WDFOBJECT *out_mem, DWORD *out_type) {
+    return 0xC0000034; /* STATUS_OBJECT_NAME_NOT_FOUND */
+}
+WDFFUNC(WdfDeviceAllocAndQueryInterfaceProperty, 51)
 
 __winfnc ULONG WdfDeviceGetSystemPowerAction(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj) { return 0; /* PowerActionNone */ }
 WDFFUNC(WdfDeviceGetSystemPowerAction, 41)

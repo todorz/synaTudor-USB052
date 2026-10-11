@@ -55,9 +55,17 @@ static void tudor_cleanup(struct tudor_device *device, OVERLAPPED *ovlp, struct 
     winwdf_destroy_object((WDFOBJECT) req);
 }
 
+extern void winusb_set_active_device(libusb_device_handle *usb_dev);
+
 bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, struct tudor_device_state *state) {
     HRESULT hres;
     NTSTATUS status;
+
+    //The driver talks to the sensor directly via the real WinUsb API (LoadLibraryA("WINUSB.DLL")
+    //+ GetProcAddress) - see winapi/winusb.c - which needs to know which physical device to
+    //operate on since WinUsb_Initialize's DeviceHandle argument doesn't map to anything
+    //meaningful in this bridge (see winusb.c's own comment for why).
+    winusb_set_active_device(usb_dev);
 
     device->state = state ? *state : (struct tudor_device_state) {0};
     device->enrolling = false;
@@ -74,7 +82,10 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
 
     //Open the device through the driver
     device->reg_key = winreg_open_key(device, "HKEY_LOCAL_MACHINE\\Tudor\\Device");
-    if((status = winwdf_add_device(tudor_wdf_driver, device->reg_key, usb_dev, &device->wdf_device)) != 0) {
+    status = tudor_using_com_activation
+        ? tudor_com_add_device(device->reg_key, usb_dev, &device->wdf_device)
+        : winwdf_add_device(tudor_wdf_driver, device->reg_key, usb_dev, &device->wdf_device);
+    if(status != 0) {
         log_error("Error adding WDF device: 0x%x!", status);
         return false;
     }
@@ -113,9 +124,9 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
     WINBIO_CALL_PIPELINE(tudor_storage_adapter->Attach, device->pipeline);
 
     log_debug("Initializing pipeline interfaces...");
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->PipelineInit, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_engine_adapter->PipelineInit, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->PipelineInit, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_sensor_adapter, PipelineInit, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_engine_adapter, PipelineInit, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_storage_adapter, PipelineInit, device->pipeline);
 
     //Reset the sensor
     log_debug("Resetting sensor...");
@@ -123,16 +134,20 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
 
     //Activate the pipeline
     log_debug("Activating pipeline...");
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Activate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_engine_adapter->Activate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->Activate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_sensor_adapter, Activate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_engine_adapter, Activate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_storage_adapter, Activate, device->pipeline);
 
-    //Check the sensor status
+    //Poll briefly, since the sensor may report BUSY for a moment right after Reset()/Activate()
     log_debug("Checking sensor status...");
     ULONG sensor_status = WINBIO_SENSOR_FAILURE;
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->QueryStatus, device->pipeline, &sensor_status)
+    for(int attempt = 0; attempt < 10; attempt++) {
+        WINBIO_CALL_PIPELINE(tudor_sensor_adapter->QueryStatus, device->pipeline, &sensor_status)
+        if(sensor_status == WINBIO_SENSOR_READY || sensor_status != WINBIO_SENSOR_BUSY) break;
+        cant_fail(usleep(200000));
+    }
     if(sensor_status != WINBIO_SENSOR_READY) {
-        log_error("Sensor didn't return ready status! [status 0x%x]", status);
+        log_error("Sensor didn't return ready status! [status 0x%x]", sensor_status);
         return false;
     }
 
@@ -146,15 +161,15 @@ bool tudor_close(struct tudor_device *device) {
 
     //Deactivate the pipeline
     log_debug("Deactivating pipeline...");
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Deactivate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_engine_adapter->Deactivate, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->Deactivate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_sensor_adapter, Deactivate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_engine_adapter, Deactivate, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_storage_adapter, Deactivate, device->pipeline);
 
     //Uninitialize the pipeline
     log_debug("Uninitializing pipeline interfaces...");
-    WINBIO_CALL_PIPELINE(tudor_sensor_adapter->PipelineCleanup, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_engine_adapter->PipelineCleanup, device->pipeline);
-    WINBIO_CALL_PIPELINE(tudor_storage_adapter->PipelineCleanup, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_sensor_adapter, PipelineCleanup, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_engine_adapter, PipelineCleanup, device->pipeline);
+    WINBIO_CALL_PIPELINE_OPT(tudor_storage_adapter, PipelineCleanup, device->pipeline);
 
     log_debug("Detaching interfaces from pipeline...");
     WINBIO_CALL_PIPELINE(tudor_sensor_adapter->Detach, device->pipeline);
@@ -170,6 +185,7 @@ bool tudor_close(struct tudor_device *device) {
 
     //Remove the device
     winmodule_set_cur(&tudor_driver_dll->module);
+    if(tudor_using_com_activation) tudor_com_remove_device();
     winwdf_remove_device(device->wdf_device);
     winwdf_event_queue_flush();
     winhandle_destroy(device->reg_key);

@@ -1,37 +1,5 @@
 #include "internal.h"
 
-typedef enum {
-    WdfRequestStopActionInvalid,
-    WdfRequestStopActionSuspend,
-    WdfRequestStopActionPurge,
-    WdfRequestStopRequestCancelable
-} WDF_REQUEST_STOP_ACTION_FLAGS;
-
-typedef void __winfnc WDF_IO_QUEUE_IO_DEFAULT(WDFOBJECT Queue, WDFOBJECT Request);
-typedef void __winfnc WDF_IO_QUEUE_IO_STOP(WDFOBJECT Queue, WDFOBJECT Request, WDF_REQUEST_STOP_ACTION_FLAGS ActionFlags);
-typedef void __winfnc WDF_IO_QUEUE_IO_RESUME(WDFOBJECT Queue, WDFOBJECT Request);
-typedef void __winfnc WDF_IO_QUEUE_IO_READ(WDFOBJECT Queue, WDFOBJECT Request, size_t Length);
-typedef void __winfnc WDF_IO_QUEUE_IO_WRITE(WDFOBJECT Queue, WDFOBJECT Request, size_t Length);
-typedef void __winfnc WDF_IO_QUEUE_IO_DEVICE_CONTROL(WDFOBJECT Queue, WDFOBJECT Request, size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode);
-typedef void __winfnc WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL(WDFOBJECT Queue, WDFOBJECT Request, size_t OutputBufferLength, size_t InputBufferLength, ULONG IoControlCode);
-typedef void __winfnc WDF_IO_QUEUE_IO_CANCELED_ON_QUEUE(WDFOBJECT Queue, WDFOBJECT Request);
-
-typedef struct {
-    ULONG Size;
-    ULONG DispatchType;
-    ULONG PowerManaged;
-    BOOLEAN AllowZeroLengthRequests;
-    BOOLEAN DefaultQueue;
-    WDF_IO_QUEUE_IO_DEFAULT *EvtIoDefault;
-    WDF_IO_QUEUE_IO_READ *EvtIoRead;
-    WDF_IO_QUEUE_IO_WRITE *EvtIoWrite;
-    WDF_IO_QUEUE_IO_DEVICE_CONTROL *EvtIoDeviceControl;
-    WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL *EvtIoInternalDeviceControl;
-    WDF_IO_QUEUE_IO_STOP *EvtIoStop;
-    WDF_IO_QUEUE_IO_RESUME *EvtIoResume;
-    WDF_IO_QUEUE_IO_CANCELED_ON_QUEUE *EvtIoCanceledOnQueue;
-} WDF_IO_QUEUE_CONFIG;
-
 struct winwdf_queue {
     struct wdf_object object;
     struct winwdf_device *device;
@@ -39,7 +7,23 @@ struct winwdf_queue {
     WDF_IO_QUEUE_CONFIG config;
 
     bool stopped;
+
+    //Bridge state for queues created via tudor/com_activate.c's IWDFDevice::CreateIoQueue - NULL
+    //for queues created through the normal flat WdfIoQueueCreate path. com_devctrl_callback is the
+    //driver's own real IQueueCallbackDeviceIoControl COM object (already AddRef'd); com_facade is
+    //this queue's own persistent COM wrapper, handed back to that callback as its IWDFIoQueue arg
+    //(the callback doesn't inspect it, just passes it along, same "opaque token" pattern as
+    //IWDFDeviceInitialize elsewhere in the COM bridge).
+    void *com_devctrl_callback;
+    void *com_facade;
 };
+
+void wdf_queue_set_com_bridge(struct winwdf_queue *queue, void *devctrl_callback, void *com_facade) {
+    queue->com_devctrl_callback = devctrl_callback;
+    queue->com_facade = com_facade;
+}
+void *wdf_queue_get_com_devctrl_callback(struct winwdf_queue *queue) { return queue->com_devctrl_callback; }
+void *wdf_queue_get_com_facade(struct winwdf_queue *queue) { return queue->com_facade; }
 
 static void queue_destr(struct winwdf_queue *queue) {
     //Stop the queue
@@ -107,14 +91,37 @@ __winfnc NTSTATUS WdfIoQueueCreate(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device
     queue->config = *config;
 
     queue->stopped = false;
+    queue->com_devctrl_callback = NULL;
+    queue->com_facade = NULL;
 
     //Add queue to device
     wdf_add_device_queue(queue->device, queue);
 
     if(out) *out = &queue->object;
+    log_verbose("WdfIoQueueCreate queue=%p DispatchType=%u EvtIoDeviceControl=%p", queue, config->DispatchType, (void*) config->EvtIoDeviceControl);
     return STATUS_SUCCESS;
 }
 WDFFUNC(WdfIoQueueCreate, 85)
+
+//WdfIoQueueRetrieveNextRequest - identified by table-index gap (85=WdfIoQueueCreate,
+//87=WdfIoQueueStart, both already verified live; 86 is the only IoQueue-group slot between them,
+//and this driver's own background worker thread was observed live calling straight through this
+//exact slot to pull a request off a manually-dispatched queue). This project's queue bridge is
+//push-style only (com_activate.c dispatches requests directly to the driver's COM callback as they
+//arrive, via WdfIoQueueCreate's EvtIoDeviceControl - see com_queue_evt_io_device_control) and never
+//maintains an internal pending-request list a caller could pull from, so nothing is ever "waiting"
+//here from this function's perspective. Without a real implementation, the driver's worker thread
+//dereferenced this call's return value directly as if it were a real IWDFIoRequest-like object -
+//crashing (observed live: SIGSEGV reading a vtable slot off return value 1). Returning
+//STATUS_NO_MORE_ITEMS matches real WDF's own documented behavior for an empty manual queue, letting
+//the driver's own (real, unmodified) code handle "nothing to do yet" instead of dereferencing our
+//stub's return value as if it were a request.
+__winfnc NTSTATUS WdfIoQueueRetrieveNextRequest(WDF_DRIVER_GLOBALS *globals, WDFOBJECT queue_obj, WDFOBJECT *out_request) {
+    log_verbose("WdfIoQueueRetrieveNextRequest queue=%p", queue_obj);
+    if(out_request) *out_request = NULL;
+    return 0x8000001A; /* STATUS_NO_MORE_ITEMS */
+}
+WDFFUNC(WdfIoQueueRetrieveNextRequest, 86)
 
 __winfnc NTSTATUS WdfDeviceConfigureRequestDispatching(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device, WDFOBJECT queue_obj, WDF_REQUEST_TYPE req_type) {
     struct winwdf_queue *queue = (struct winwdf_queue*) queue_obj;

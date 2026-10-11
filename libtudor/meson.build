@@ -17,6 +17,7 @@ libtudor_src = [
     'src/pe/coff_header.c',
 
     'src/winapi/string.c',
+    'src/winapi/window.c',
     'src/winapi/list.c',
     'src/winapi/thread.c',
     'src/winapi/handle.c',
@@ -34,6 +35,8 @@ libtudor_src = [
     'src/winapi/suspend.c',
     'src/winapi/io.c',
     'src/winapi/system.c',
+    'src/winapi/winusb.c',
+    'src/winapi/setupapi.c',
 
     'src/winapi/crypt/rsa_aes.c',
     'src/winapi/crypt/evp_digest.c',
@@ -59,6 +62,7 @@ libtudor_src = [
 
     'src/tudor/async.c',
     'src/tudor/driver.c',
+    'src/tudor/com_activate.c',
     'src/tudor/device.c',
     'src/tudor/storage.c',
     'src/tudor/reg.c'
@@ -70,6 +74,13 @@ driver_dll_names = [
 ]
 
 add_global_arguments('-Wno-incompatible-pointer-types', language : 'c')
+
+#ms_abi-tagged functions here are called by real Windows machine code that follows the Windows x64
+#ABI, which has no equivalent of the SysV "red zone" (128 bytes below rsp a leaf function may use
+#without adjusting rsp). GCC's ms_abi attribute fixes up parameter/register conventions but does not
+#by itself disable red-zone codegen, so without this flag, generated code can write below its own
+#rsp into memory the caller (real Windows-ABI machine code) still considers part of its own frame.
+add_global_arguments('-mno-red-zone', language : 'c')
 
 driver_dlls = custom_target('driver-download', 
     output: driver_dll_names,

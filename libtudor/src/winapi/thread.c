@@ -40,12 +40,11 @@ static DWORD thread_wait(struct win_thread *thread, DWORD timeout) {
     if(timeout == INFINITE) {
         cant_fail_ret(pthread_join(thread->thread, NULL));
     } else {
-        struct timespec time;
-        time.tv_nsec = timeout * 10000000L;
-        time.tv_sec = timeout / 1000L;
-        int err = pthread_timedjoin_np(thread->thread, NULL, &time);
+        struct timespec deadline;
+        win_timeout_to_abstime(timeout, &deadline);
+        int err = pthread_timedjoin_np(thread->thread, NULL, &deadline);
         if(err == ETIMEDOUT) return WAIT_TIMEOUT;
-        cant_fail(err);
+        cant_fail_ret(err);
     }
 
     thread->has_detached = TRUE;
@@ -134,3 +133,15 @@ __winfnc void ExitThread(DWORD exit_code) {
     pthread_exit((void*) (uintptr_t) exit_code);
 }
 WINAPI(ExitThread)
+
+//A pthread can't be safely killed from the outside (and pthread_cancel would try to unwind through
+//Windows-ABI frames without unwind info), so this only reports the request. The driver uses it as
+//a last-resort fallback during teardown after asking the thread to quit (PostThreadMessageW).
+__winfnc BOOL TerminateThread(HANDLE handle, DWORD exit_code) {
+    log_warn("TerminateThread(%p, %u) called - not supported, leaving the thread running", (void*) handle, (unsigned) exit_code);
+    return TRUE;
+}
+WINAPI(TerminateThread)
+
+__winfnc HANDLE GetCurrentThread() { return (HANDLE) -2; } //Pseudo-handle, like the real thing
+WINAPI(GetCurrentThread)

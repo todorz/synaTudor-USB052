@@ -109,6 +109,11 @@ static void *libusb_poll_thread_func(void *arg) {
 }
 
 int main(int argc, char **argv) {
+    //Unbuffered so [DBG]/[VRB] (stdout) interleave in true chronological order with [WRN]/[ERR]
+    //(stderr) - otherwise stdio's default line/full buffering can visibly reorder log output
+    //relative to what actually happened, which is actively misleading when debugging timing.
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     //Parse arguments
     if(argc < 2) {
         log_error("Usage: %s <data store> [flags]", argv[0]);
@@ -133,12 +138,16 @@ int main(int argc, char **argv) {
     puts("Even though the CLI employs sandboxing, its security is in no way comparable to the one found in the libfprint integration.");
     puts("A malicious driver could take over your local user account!");
     puts("This CLI is only intended to be used for debugging and/or small scale tests.");
-    printf("Press 'y' to continue, any key to exit: ");
-    char chr = 0;
-    scanf("%c", &chr);
-    if(chr != 'y') { 
-        puts("Exiting....");
-        return EXIT_FAILURE;
+    if(!getenv("TUDOR_CLI_ASSUME_YES")) {
+        printf("Press 'y' to continue, any key to exit: ");
+        char chr = 0;
+        scanf("%c", &chr);
+        if(chr != 'y') {
+            puts("Exiting....");
+            return EXIT_FAILURE;
+        }
+    } else {
+        puts("TUDOR_CLI_ASSUME_YES set, skipping confirmation prompt.");
     }
 
     //Initialize libcrypto

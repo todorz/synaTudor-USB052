@@ -41,12 +41,26 @@ NTSTATUS winwdf_add_device(struct winwdf_driver *driver, HANDLE reg_key, libusb_
 static void driver_destr(struct winwdf_driver *driver) {
     //Call callbacks
     if(driver->cfg.EvtDriverUnload) driver->cfg.EvtDriverUnload(&driver->object);
-    driver->globals->Driver = NULL;
+    //globals is NULL for drivers constructed via winwdf_create_driver_for_com (the legacy UMDF1
+    //COM activation path never populates a WDF_DRIVER_GLOBALS for its driver object).
+    if(driver->globals) driver->globals->Driver = NULL;
 
     //Free memory
     wdf_cleanup_obj(&driver->object);
     winhandle_destroy(driver->reg_key);
     free(driver);
+}
+
+//See wdf.h for why this exists alongside WdfDriverCreate.
+struct winwdf_driver *winwdf_create_driver_for_com(HANDLE reg_key) {
+    struct winwdf_driver *driver = (struct winwdf_driver*) malloc(sizeof(struct winwdf_driver));
+    if(!driver) return NULL;
+
+    wdf_create_obj(NULL, &driver->object, (wdf_obj_destr_fnc*) driver_destr, NULL);
+    driver->globals = NULL;
+    driver->cfg = (WDF_DRIVER_CONFIG) {0};
+    driver->reg_key = reg_key;
+    return driver;
 }
 
 HANDLE wdf_get_driver_reg_key(struct winwdf_driver *driver) { return driver->reg_key; }

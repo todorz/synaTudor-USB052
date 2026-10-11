@@ -2,6 +2,7 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "internal.h"
 
 static struct {
@@ -51,11 +52,14 @@ __constr static void init_peb() {
     process_peb.inherited_addr_space = FALSE;
     process_peb.read_img_file_exec_opts = TRUE;
     process_peb.being_debugged = FALSE;
-    process_peb.mutant = (HANDLE) 0xdeadc0de;
-    process_peb.image_base_addr = (void*) 0xdeadc0de;
-    process_peb.peb_ldr_data = (void*) 0xdeadc0de;
+    //As with the TIB fields above, NULL is used for these rarely-read fields instead of a fake
+    //non-null placeholder, since code that checks "if (field)" before dereferencing fails
+    //gracefully against NULL but crashes against a bogus non-null pointer.
+    process_peb.mutant = NULL;
+    process_peb.image_base_addr = NULL;
+    process_peb.peb_ldr_data = NULL;
     process_peb.proc_params = &process_params;
-    process_peb.sub_sys_data = (void*) 0xdeadc0de;
+    process_peb.sub_sys_data = NULL;
     process_peb.proc_heap = (HANDLE) -1;
 }
 
@@ -63,19 +67,53 @@ __constr void win_init_tib() {
     //TODO This is incredibly hacky and crude
 
     //Initialize the Thread Information Block
-    thread_tib.cur_seh_frame = (void*) 0xdeadc0de;
-    thread_tib.stack_base = (void*) 0xdeadc0de;
-    thread_tib.stack_limit = (void*) 0xdeadc0de;
-    thread_tib.sub_system_tib = (void*) 0xdeadc0de;
-    thread_tib.fiber_data = (void*) 0xdeadc0de;
-    thread_tib.arbitrary_data = (void*) 0xdeadc0de;
-    thread_tib.teb_address = (void*) 0xdeadc0de;
+    //cur_seh_frame (NT_TIB.ExceptionList) is a legacy x86 SEH-chain vestige; real x64 code uses
+    //table-based SEH via the PE's unwind info instead and doesn't walk this field, so it's set to
+    //the same "unused" sentinel real Windows uses rather than a fake placeholder.
+    thread_tib.cur_seh_frame = (void*) -1;
 
-    thread_tib.env_ptr = (void*) 0xdeadc0de;
+    //stack_base/stack_limit (NT_TIB.StackBase/StackLimit, at %gs:0x8/%gs:0x10) are read by real
+    //driver code such as the CRT's _chkstk stack-probing loop (used for dynamically-sized stack
+    //allocations), which touches memory based on StackLimit to trigger guard-page growth. Leaving
+    //these as placeholder values risks that code touching arbitrary unrelated memory instead of
+    //harmlessly no-op'ing, so use this thread's real stack bounds instead.
+    pthread_attr_t stack_attr;
+    void *real_stack_addr; size_t real_stack_size;
+    if(
+        pthread_getattr_np(pthread_self(), &stack_attr) == 0 &&
+        pthread_attr_getstack(&stack_attr, &real_stack_addr, &real_stack_size) == 0
+    ) {
+        thread_tib.stack_limit = real_stack_addr;
+        thread_tib.stack_base = (uint8_t*) real_stack_addr + real_stack_size;
+        pthread_attr_destroy(&stack_attr);
+    } else {
+        //pthread_getattr_np can still fail here (e.g. inside a sandbox that blocks reading
+        ///proc/self/maps, which it needs for the main thread specifically). A real, valid, in-
+        //bounds stack address - even an imprecise one - is far safer than 0xdeadc0de: it keeps
+        //_chkstk's guard-page-touching loop inside real, mapped stack memory instead of touching
+        //arbitrary unrelated memory. 8MiB is the common default Linux stack size (see RLIMIT_STACK).
+        void *approx_stack_ptr = &stack_attr;
+        thread_tib.stack_limit = approx_stack_ptr - 8*1024*1024;
+        thread_tib.stack_base = approx_stack_ptr + 64*1024;
+    }
+
+    //These remaining fields are rarely read by ordinary driver code, but a fake non-null sentinel
+    //like 0xdeadc0de is strictly worse than NULL: code that defensively checks "if (field) use it"
+    //will skip a NULL gracefully, but will happily dereference a non-null garbage pointer and
+    //crash (as observed - a driver thread dereferenced one of these directly). NULL at least fails
+    //the same way real Windows would for a field that's genuinely unset.
+    thread_tib.sub_system_tib = NULL;
+    thread_tib.fiber_data = NULL;
+    thread_tib.arbitrary_data = NULL;
+    //teb_address (NT_TIB.Self) is a real, commonly-checked self-referential pointer (code sometimes
+    //validates NtCurrentTeb()->Self == NtCurrentTeb()), so it gets a real, valid answer.
+    thread_tib.teb_address = &thread_tib;
+
+    thread_tib.env_ptr = NULL;
     thread_tib.proc_id = getpid();
     thread_tib.thread_id = win_get_thread_id();
-    thread_tib.active_rpc = (void*) 0xdeadc0de;
-    thread_tib.thread_local_storage = (void*) 0xdeadc0de;
+    thread_tib.active_rpc = NULL;
+    thread_tib.thread_local_storage = NULL;
     thread_tib.peb_ptr = &process_peb;
     syscall(SYS_arch_prctl, ARCH_SET_GS, &thread_tib);
 }
@@ -91,6 +129,40 @@ __winfnc DWORD GetCurrentProcessId() {
     return getpid();
 }
 WINAPI(GetCurrentProcessId)
+
+//Real multi-process isolation/handle duplication isn't supported here; the common case (a driver
+//opening a handle to itself, e.g. to query its own token/memory info) is supported by returning
+//the same pseudo-handle GetCurrentProcess does, and opening any other PID fails cleanly rather
+//than fabricating a handle to a process we can't actually operate on.
+__winfnc HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
+    if(pid == (DWORD) getpid()) return (HANDLE) -1;
+    log_warn("OpenProcess: Opening a process other than the current one isn't supported! [pid %u]", pid);
+    winerr_set_code(ERROR_INVALID_PARAMETER);
+    return NULL;
+}
+WINAPI(OpenProcess)
+
+//A fixed placeholder, not a real filesystem path - good enough for a driver that's just querying/
+//logging its own image path rather than parsing it as an actual NT path. Deliberately not resolved
+//via readlink("/proc/self/exe", ...): under tudor-host's sandbox, readlink is restricted to the
+//narrow "/proc/self/fd/<usb_fd>" pattern used to recover the USB device path, and any other path
+//(this one included) is treated as a sandbox escape attempt and aborts the process.
+__winfnc DWORD K32GetProcessImageFileNameA(HANDLE process, char *out_name, DWORD size) {
+    if(process != (HANDLE) -1) {
+        log_warn("K32GetProcessImageFileNameA: Only the current process is supported!");
+        winerr_set_code(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    static const char fake_path[] = "C:\\Windows\\System32\\Drivers\\WudfHost.exe";
+    DWORD len = (DWORD) (sizeof(fake_path) - 1);
+    if(size > 0 && len >= size) len = size - 1;
+
+    memcpy(out_name, fake_path, len);
+    if(size > 0) out_name[len] = 0;
+    return len;
+}
+WINAPI(K32GetProcessImageFileNameA)
 
 __winfnc DWORD GetCurrentThreadId() {
     return win_get_thread_id();
@@ -219,73 +291,36 @@ __winfnc BOOL IsProcessorFeaturePresent(DWORD feature) {
 }
 WINAPI(IsProcessorFeaturePresent)
 
-#define ARM64_MAX_BREAKPOINTS 8
-#define ARM64_MAX_WATCHPOINTS 2
-
-typedef union {
-    struct {
-        ULONGLONG Low;
-        LONGLONG High;
-    } DUMMYSTRUCTNAME;
-    double D[2];
-    float S[4];
-    WORD H[8];
-    BYTE B[16];
-} ARM64_NT_NEON128;
-
+//Prefix of the real AMD64 CONTEXT struct layout (winnt.h), up through the general-purpose
+//registers. The caller always allocates a full-size real CONTEXT (its compiler knows the true,
+//much larger size including FP/vector state), so writing only this prefix and leaving the rest
+//of that allocation untouched is safe.
 typedef struct {
+    DWORD64 P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
     DWORD ContextFlags;
-    DWORD Cpsr;
-    union {
-        struct {
-            DWORD64 X0;
-            DWORD64 X1;
-            DWORD64 X2;
-            DWORD64 X3;
-            DWORD64 X4;
-            DWORD64 X5;
-            DWORD64 X6;
-            DWORD64 X7;
-            DWORD64 X8;
-            DWORD64 X9;
-            DWORD64 X10;
-            DWORD64 X11;
-            DWORD64 X12;
-            DWORD64 X13;
-            DWORD64 X14;
-            DWORD64 X15;
-            DWORD64 X16;
-            DWORD64 X17;
-            DWORD64 X18;
-            DWORD64 X19;
-            DWORD64 X20;
-            DWORD64 X21;
-            DWORD64 X22;
-            DWORD64 X23;
-            DWORD64 X24;
-            DWORD64 X25;
-            DWORD64 X26;
-            DWORD64 X27;
-            DWORD64 X28;
-            DWORD64 Fp;
-            DWORD64 Lr;
-        } DUMMYSTRUCTNAME;
-        DWORD64 X[31];
-    } DUMMYUNIONNAME;
-    DWORD64 Sp;
-    DWORD64 Pc;
-    ARM64_NT_NEON128 V[32];
-    DWORD Fpcr;
-    DWORD Fpsr;
-    DWORD Bcr[ARM64_MAX_BREAKPOINTS];
-    DWORD64 Bvr[ARM64_MAX_BREAKPOINTS];
-    DWORD Wcr[ARM64_MAX_WATCHPOINTS];
-    DWORD64 Wvr[ARM64_MAX_WATCHPOINTS];
-} ARM64_NT_CONTEXT;
+    DWORD MxCsr;
+    WORD SegCs, SegDs, SegEs, SegFs, SegGs, SegSs;
+    DWORD EFlags;
+    DWORD64 Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+    DWORD64 Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    DWORD64 R8, R9, R10, R11, R12, R13, R14, R15;
+    DWORD64 Rip;
+} AMD64_CONTEXT_PREFIX;
 
-__winfnc void RtlCaptureContext(ARM64_NT_CONTEXT *context) {
-    log_warn("Unsupported function RtlCaptureContext called!");
-    *context = (ARM64_NT_CONTEXT) {0};
+//The driver's CRT only calls this from its stack-buffer-overrun reporting path (__report_gsfailure:
+//RtlCaptureContext -> RtlLookupFunctionEntry -> RtlVirtualUnwind, right before fast-failing), i.e.
+//after a stack cookie check has already failed. Its security cookie setup doesn't use it. So no real
+//register capture is needed - just a well-formed x86-64 context: zeroed, with the fixed user-mode
+//segment/flag values and the caller's real stack and instruction pointers.
+__winfnc void RtlCaptureContext(AMD64_CONTEXT_PREFIX *context) {
+    log_warn("RtlCaptureContext called - the driver is likely reporting a stack buffer overrun!");
+    *context = (AMD64_CONTEXT_PREFIX) {0};
+    context->MxCsr = 0x1f80;
+    context->SegCs = 0x33;
+    context->SegSs = 0x2b;
+    context->EFlags = 0x202;
+    context->Rsp = (DWORD64) (uintptr_t) __builtin_frame_address(0);
+    context->Rip = (DWORD64) (uintptr_t) __builtin_return_address(0);
 }
 WINAPI(RtlCaptureContext)
 

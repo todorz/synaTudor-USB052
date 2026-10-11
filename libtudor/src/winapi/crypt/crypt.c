@@ -4,6 +4,12 @@
 
 __winfnc BOOL CryptAcquireContextA(struct crypt_provider **prov, const char *cont_name, const char *prov_name, DWORD prov_type, DWORD flags) {
     switch(prov_type) {
+        //PROV_RSA_FULL is what real Windows pairs with "Microsoft Enhanced Cryptographic Provider
+        //v1.0" (the CSP name this driver actually requests) - crypt_prov_rsa_aes has nothing AES-
+        //specific baked into it (import/destroy_key are both no-ops, and CryptCreateHash's algorithm
+        //table is provider-agnostic), so it's just as correct a backing provider for RSA_FULL as it
+        //is for RSA_AES.
+        case PROV_RSA_FULL:
         case PROV_RSA_AES: *prov = &crypt_prov_rsa_aes; return TRUE;
         default: {
             log_warn("CryptAcquireContextA | Couldn't find provider for container '%s' provider '%s' provider type 0x%x flags 0x%x", cont_name, prov_name, prov_type, flags);

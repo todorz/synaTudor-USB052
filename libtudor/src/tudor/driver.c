@@ -33,6 +33,12 @@ static struct winmodule ntdll_module = {
     .environ = (const char*[]) { NULL }
 };
 
+static struct winmodule kernel32_module = {
+    .name = "kernel32.dll",
+    .cmdline = "kernel32.dll",
+    .environ = (const char*[]) { NULL }
+};
+
 #define DLL_PROCESS_ATTACH 1
 #define DLL_PROCESS_DETACH 0
 #define DLL_THREAD_ATTACH 2
@@ -45,10 +51,12 @@ WINBIO_ENGINE_INTERFACE *tudor_engine_adapter;
 
 static DRIVER_OBJECT umdf_driver;
 struct winwdf_driver *tudor_wdf_driver;
+bool tudor_using_com_activation = false;
 
 bool tudor_init() {
     //Register dummy modules
     winmodule_register(&ntdll_module);
+    winmodule_register(&kernel32_module);
 
     if(tudor_log_traces) {
         //Register trace messages
@@ -98,28 +106,41 @@ bool tudor_init() {
         }
     }
 
-    //Call UMDF driver entry function
+    //Call UMDF driver entry function - either the modern (UMDF2/KMDF-compatible) flat function
+    //table export, or, if that's not present, fall back to the legacy UMDF 1.x COM-based
+    //DllGetClassObject/IDriverEntry activation model.
     init_winwdf();
     winmodule_set_cur(&tudor_driver_dll->module);
 
-    char16_t *reg_path_wstr = winstr_from_str("HKEY_LOCAL_MACHINE\\Tudor\\Driver");
-    UNICODE_STRING reg_path = {
-        .Length = winstr_len(reg_path_wstr)+1,
-        .MaximumLength = winstr_len(reg_path_wstr)+1,
-        .Buffer = reg_path_wstr
-    };
+    void *fx_driver_entry = find_dll_export_optional(&tudor_driver_dll->image, "FxDriverEntryUm");
+    if(fx_driver_entry) {
+        char16_t *reg_path_wstr = winstr_from_str("HKEY_LOCAL_MACHINE\\Tudor\\Driver");
+        UNICODE_STRING reg_path = {
+            .Length = winstr_len(reg_path_wstr)+1,
+            .MaximumLength = winstr_len(reg_path_wstr)+1,
+            .Buffer = reg_path_wstr
+        };
 
-    NTSTATUS status;
-    if((status = ((api_FxDriverEntryUm) find_dll_export(&tudor_driver_dll->image, "FxDriverEntryUm"))(&wdf_loader, NULL, &umdf_driver, &reg_path)) != 0) {
-        log_error("Error in UMDF driver entry function: 0x%x!", status);
-        return false;
-    }
+        NTSTATUS status;
+        if((status = ((api_FxDriverEntryUm) fx_driver_entry)(&wdf_loader, NULL, &umdf_driver, &reg_path)) != 0) {
+            log_error("Error in UMDF driver entry function: 0x%x!", status);
+            return false;
+        }
 
-    free(reg_path_wstr);
+        free(reg_path_wstr);
 
-    if(!(tudor_wdf_driver = winwdf_get_driver(&wdf_globals))) {
-        log_error("UMDF entry function didn't create a WDF driver!");
-        return false;
+        if(!(tudor_wdf_driver = winwdf_get_driver(&wdf_globals))) {
+            log_error("UMDF entry function didn't create a WDF driver!");
+            return false;
+        }
+    } else {
+        log_info("No FxDriverEntryUm export, falling back to legacy COM-based driver activation...");
+        HANDLE reg_key = winreg_open_key(NULL, "HKEY_LOCAL_MACHINE\\Tudor\\Driver");
+        if(!tudor_init_com_driver(&tudor_driver_dll->image, reg_key, &tudor_wdf_driver)) {
+            log_error("COM-based driver activation failed!");
+            return false;
+        }
+        tudor_using_com_activation = true;
     }
 
     //Query WINBIO interfaces
@@ -134,6 +155,7 @@ bool tudor_init() {
         log_error("Error querying engine interface: 0x%x!", hres);
         return false;
     }
+
 
     return true;
 }
@@ -171,6 +193,7 @@ bool tudor_shutdown() {
 
     //Unregister dummy modules
     winmodule_unregister(&ntdll_module);
+    winmodule_unregister(&kernel32_module);
 
     return true;
 }
