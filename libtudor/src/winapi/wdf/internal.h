@@ -74,11 +74,10 @@ struct wdf_device_init;
 struct wdf_device_init *wdf_create_device_init(struct winwdf_driver *driver, HANDLE reg_key, libusb_device_handle *usb_dev, struct winwdf_device **out_dev);
 HANDLE wdf_get_device_reg_key(struct winwdf_device *driver);
 
+struct wdf_usb_device;
 libusb_device_handle *wdf_get_libusb_device(struct winwdf_device *dev);
 struct wdf_usb_device * wdf_get_usb_device(struct winwdf_device *dev);
 void wdf_set_usb_device(struct winwdf_device *dev, struct wdf_usb_device *usb_dev);
-//wdf_usb_device/interface/pipe forward-declared, and the raw-buffer USB target entry points these
-//use, now live in wdf.h (shared with tudor/com_activate.c's COM USB target bridge) - see there.
 
 WDF_FILEOBJECT_CONFIG *wdf_get_fs_config(struct winwdf_device *dev);
 WDF_OBJECT_ATTRIBUTES *wdf_get_fs_obj_attrs(struct winwdf_device *dev);

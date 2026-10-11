@@ -110,43 +110,4 @@ void wdf_queue_set_com_bridge(struct winwdf_queue *queue, void *devctrl_callback
 void *wdf_queue_get_com_devctrl_callback(struct winwdf_queue *queue);
 void *wdf_queue_get_com_facade(struct winwdf_queue *queue);
 
-//USB - exposed for tudor/com_activate.c's IWDFUsbTargetFactory/Device/Interface/Pipe bridge, same
-//reasoning as the queue functions above: a COM-activated driver only ever reaches USB target
-//creation through these flat functions called directly. WDF_USB_PIPE_TYPE/WDF_USB_PIPE_INFORMATION
-//need to be here (not private to usb.c) since WdfUsbInterfaceGetConfiguredPipe's real out-param
-//type is cached directly into the COM pipe facade at creation time - see FINDINGS.md for the USB
-//target implementation this bridges to.
-struct wdf_usb_device;
-struct wdf_usb_interface;
-struct wdf_usb_pipe;
-
-typedef enum {
-    WdfUsbPipeTypeInvalid,
-    WdfUsbPipeTypeControl,
-    WdfUsbPipeTypeIsochronous,
-    WdfUsbPipeTypeBulk,
-    WdfUsbPipeTypeInterrupt
-} WDF_USB_PIPE_TYPE;
-
-typedef struct {
-    ULONG Size;
-    ULONG MaximumPacketSize;
-    UCHAR EndpointAddress;
-    UCHAR Interval;
-    UCHAR SettingIndex;
-    WDF_USB_PIPE_TYPE PipeType;
-    ULONG MaximumTransferSize;
-} WDF_USB_PIPE_INFORMATION;
-
-__winfnc NTSTATUS WdfUsbTargetDeviceCreate(WDF_DRIVER_GLOBALS *globals, WDFOBJECT dev_obj, WDF_OBJECT_ATTRIBUTES *obj_attrs, WDFOBJECT *out);
-__winfnc WDFOBJECT WdfUsbTargetDeviceGetInterface(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_dev_obj, UCHAR interface_idx);
-__winfnc WDFOBJECT WdfUsbInterfaceGetConfiguredPipe(WDF_DRIVER_GLOBALS *globals, WDFOBJECT usb_if_obj, UCHAR idx, WDF_USB_PIPE_INFORMATION *info);
-int wdf_usb_device_get_num_interfaces(struct wdf_usb_device *usb_dev);
-NTSTATUS wdf_usb_pipe_format_request_for_read_raw(struct wdf_usb_pipe *usb_pipe, struct winwdf_request *req, void *buf, size_t buf_len);
-NTSTATUS wdf_usb_pipe_format_request_for_write_raw(struct wdf_usb_pipe *usb_pipe, struct winwdf_request *req, void *buf, size_t buf_len);
-//Exposed (same ms_abi reasoning as WdfRequestComplete above) for tudor/com_activate.c's
-//IWDFIoRequest::Send bridge to hand off to the real wdf_start_request machinery directly, rather
-//than needing WDF_REQUEST_SEND_OPTIONS (private to request.c/usb.c) just to call WdfRequestSend.
-void wdf_start_request(struct winwdf_request *req, struct wdf_object *target, int timeout);
-
 #endif

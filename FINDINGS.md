@@ -98,9 +98,14 @@ and would affect other drivers too.
 - **Out-params that must be filled in:** generic stubs returned `S_OK` without
   writing out-params, and the driver then used uninitialized pointers.
   `RetrieveDeviceName` (must contain `usb`, or OnPrepareHardware does nothing),
-  `RetrieveDeviceInstanceId`, `RetrieveDevicePropertyStore`, and
+  `RetrieveDevicePropertyStore`, and
   `IWDFPropertyStoreFactory::RetrieveDevicePropertyStore` (the
   "PairingContext" lookups) are real implementations now.
+- `RetrieveDeviceInstanceId`, `GetDefaultIoTarget`, `MapIoSpace` and
+  `CreateInterrupt` are implemented too, but the driver never calls them
+  (coverage-checked). They're kept so an unexpected call doesn't get an unset
+  out-param. The driver doesn't use WDF USB targets at all, so there's no
+  `IWDFUsbTargetFactory` bridge.
 - `GetInputMemory`/`GetOutputMemory` return a small scratch buffer when the
   request has none, because the driver reads them unconditionally.
 - `MarkCancelable`/`UnmarkCancelable` are bridged onto
@@ -127,22 +132,24 @@ and would affect other drivers too.
 - Threads created by libtudor itself (overlapped-callback thread) now set up
   their own TIB. A new pthread inherits its creator's GS base, so `__chkstk`
   probed against the wrong stack limits.
-- `QueryPerformanceCounter` (now ns, plus `QueryPerformanceFrequency`),
-  `GetTickCount` (now ms) and `GetSystemTimeAsFileTime` (now real FILETIME) had
-  inconsistent units.
+- `QueryPerformanceCounter` (now ns, plus `QueryPerformanceFrequency`) and
+  `GetTickCount` (now ms) had inconsistent units. `GetSystemTimeAsFileTime`
+  (now a real FILETIME) had the same problem, but this driver never calls it.
 - `-mno-red-zone`: Windows-ABI callers don't respect the SysV red zone.
 
 ### Other WinAPI fixes
 - `WideCharToMultiByte`/`MultiByteToWideChar` only converted one character.
-- `BCryptEncrypt`/`BCryptDecrypt` didn't write back the chained CBC IV.
-- `EnterCriticalSection` no longer writes `LockCount`/`RecursionCount`/
-  `OwningThread` (that corrupted driver memory aliasing the struct).
 - `GetModuleFileNameW` returns a full path. Stack-cookie pre-population and
   copying the PE headers into the image (the driver reads its own headers).
 - New APIs: hidden window + message queue (`window.c`: cross-thread
   `PostThreadMessageW`, `FindWindowW`, `Get/SetWindowLongPtrW`, ...),
   power/session notification stubs, `VirtualProtect`, `HeapSize`, event-log
   and ETW stubs, `TerminateThread` (warn-only), and more.
+
+### Fixed, but not exercised by this driver
+- `BCryptEncrypt`/`BCryptDecrypt` didn't write back the chained CBC/CFB IV.
+  The USB052 driver doesn't import either function (it only uses BCrypt for
+  key generation, signing and key agreement), so this has never run here.
 
 ### tudor-host / libfprint-tod / CLI
 - tudor-host aborted when the engine flagged an enrollment as a duplicate

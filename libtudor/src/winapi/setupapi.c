@@ -2,34 +2,17 @@
 #include <libusb.h>
 #include "internal.h"
 
-//Minimal SetupDi*/CreateFile support for exactly one purpose: letting a driver that talks to its
-//device via the real WinUsb.dll API (see winusb.c) discover a device path and CreateFile it,
-//which is the normal prerequisite for WinUsb_Initialize on real Windows. This project's SetupDi
-//imports were previously entirely unresolved (would abort loudly if called - see loader.c/stub.c),
-//and live tracing during this investigation showed the driver never reaches them, meaning it gets
-//stuck before ever calling WinUsb_Initialize at all.
-//
-//Real SetupDi enumerates by device interface class GUID against the system's actual device
-//tree - something this project has no equivalent of. Since this bridge only ever has exactly one
-//real device to offer for the whole process lifetime (see winusb.c's g_active_usb_dev), the
-//ClassGuid/Enumerator/ everything else is ignored and a single fixed fake device path is always
-//returned as the (and only) enumerated interface; CreateFileA recognizes that exact path and hands
-//back a handle wrapping the one active libusb device, exactly like a real WinUsb device file
-//handle would.
+//Minimal SetupDi*/CreateFile support for drivers that talk to their device through the real WinUsb
+//API (see winusb.c). Only one device ever exists in this process, so SetupDi enumeration ignores the
+//class GUID and always returns a single fake device path. The USB052 driver doesn't enumerate via
+//SetupDi at all (coverage-checked) - it CreateFile's the name from IWDFDevice::RetrieveDeviceName -
+//but imports these functions, so they're kept as a working implementation.
 
 #define FAKE_DEVICE_PATH "\\\\?\\TUDOR#USB#000#{f72fe0d4-cbcb-407d-8814-9ed673d0dd6b}"
 
-//Also accept FAKE_WDF_DEVICE_NAME (com_activate.c's "\Device\usbpdo-0", which OnPrepareHardware
-//CreateFileA/W's directly) so that call succeeds too. A previous pass rejected this, reasoning
-//(from the driver's INF `UmdfDispatcher=WinUsb` directive alone) that the real USB access model
-//must be IWDFDevice::GetDefaultIoTarget()/raw-IOCTL, not WinUsb_Initialize, and treated the SIGSEGV
-//this exposes past `WinUsb_Initialize: claimed interface 0, 5 pipes` as evidence of a wrong path.
-//Reconsidered after external research (see FINDINGS.md): a working reference port of a sibling
-//Synaptics Tudor/WBDI-family driver only reaches real pairing/TLS/hardware communication via
-//exactly this kind of real WinUsb-backed bulk transfer - "untested path -> new crash" has been the
-//correct-direction pattern for every other real bug found this session (WideCharToMultiByte,
-//RetrieveDeviceName, HeapFree, ctx->field_0x100, ...), not evidence of a dead end by itself. Worth
-//pursuing the resulting crash as a genuine bug rather than reverting on sight.
+//Recognized device paths: the SetupDi-enumerated FAKE_DEVICE_PATH, and com_activate.c's
+//FAKE_WDF_DEVICE_NAME ("\Device\usbpdo-0"), which the USB052 driver's OnPrepareHardware opens
+//directly before calling WinUsb_Initialize on it.
 static bool is_recognized_fake_device_path(const char *name) {
     return name && (strcmp(name, FAKE_DEVICE_PATH) == 0 || strcmp(name, "\\Device\\usbpdo-0") == 0);
 }

@@ -66,16 +66,24 @@ __winfnc void DeleteCriticalSection(CRITICAL_SECTION* sect) {
 }
 WINAPI(DeleteCriticalSection)
 
-//LockCount/RecursionCount/OwningThread are intentionally left untouched - nothing in this codebase
-//reads them back, the real (recursive) pthread mutex already tracks its own recursion internally,
-//and writing to them corrupted an unrelated driver object that happened to alias this memory - see
-//FINDINGS.md.
 __winfnc void EnterCriticalSection(CRITICAL_SECTION *sect) {
+    //Lock the mutex
     cant_fail_ret(pthread_mutex_lock((pthread_mutex_t*) sect->LockSemaphore));
+
+    if(sect->RecursionCount++ == 0) {
+        sect->LockCount = 1;
+        sect->OwningThread = (HANDLE) pthread_self();
+    }
 }
 WINAPI(EnterCriticalSection)
 
 __winfnc void LeaveCriticalSection(CRITICAL_SECTION *sect) {
+    if(--sect->RecursionCount == 0) {
+        sect->LockCount = 0;
+        sect->OwningThread = NULL;
+    }
+
+    //Unlock the mutex
     cant_fail_ret(pthread_mutex_unlock((pthread_mutex_t*) sect->LockSemaphore));
 }
 WINAPI(LeaveCriticalSection)

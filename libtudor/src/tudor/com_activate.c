@@ -1,7 +1,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "internal.h"
-#include "winapi/wdf/internal.h" //struct wdf_memory, wdf_usb_device/interface/pipe accessors - see the USB target bridge below
 
 //Bridges into drivers using the legacy UMDF 1.x COM-based activation model (DllGetClassObject ->
 //IClassFactory -> IDriverEntry::OnInitialize/OnDeviceAdd), as opposed to the modern UMDF2/KMDF-
@@ -49,14 +48,6 @@ static const GUID g_iid_iwdf_device3 = DEFINE_GUID(863d943a, c9cd, 4655, a8d6, c
 //practice), so OnD0Entry was added as the next real PnP-lifecycle step to try.
 static const GUID g_iid_ipnp_callback_hardware = DEFINE_GUID(51433bd3, c7c1, 4bd8, b4c1, ab1e034626cc);
 static const GUID g_iid_ipnp_callback = DEFINE_GUID(27c32374, cc45, 4840, 857e, 8e5ef7c0ebff);
-//IWDFUsbTargetFactory - the documented UMDF 1.x mechanism for USB access (QueryInterface on the
-//device object, then CreateUsbTargetDevice). Confirmed live this driver never actually requests
-//it (see FINDINGS.md) - wired up here
-//anyway on the chance some as-yet-unfound precondition is what's actually gating the attempt, not
-//the interface's absence. Real vtable layouts below verified directly against wudfusb.h's raw
-//flattened C-style vtable structs (not a summarized/renumbered fetch, whose numbering
-//can be off by one).
-static const GUID g_iid_iwdf_usb_target_factory = DEFINE_GUID(3f7becf9, 3a65, 4348, a4f3, 339d5734a9c6);
 
 //IWDFPropertyStoreFactory - found live tracing the exact same "WinUsb_Initialize succeeds, then a
 //crash right after" chain triggered by CreateFileA also recognizing OnPrepareHardware's own device
@@ -77,7 +68,6 @@ static const GUID g_iid_iwdf_property_store_factory = DEFINE_GUID(45be7e06, 9b65
 
 enum com_iface_tag { COM_IFACE_NONE = 0, COM_IFACE_IWDFDRIVER, COM_IFACE_IWDFDEVICE };
 
-static struct com_obj *get_usb_target_factory_facade(struct winwdf_device *device);
 static struct com_obj *get_property_store_factory_facade(void);
 
 typedef void *(__winfnc *com_generic_fnc)(void *self, void *a, void *a2, void *a3, void *a4, void *a5);
@@ -126,14 +116,6 @@ __winfnc static void *com_query_interface(struct com_obj *self, const GUID *iid,
         return 0; //S_OK
     }
 
-    //IWDFUsbTargetFactory is only ever obtained via QueryInterface on the device object itself
-    //(never a re-query of an existing facade), so this doesn't need iface-family tagging like
-    //IWDFDevice/IWDFDriver above - just a direct self-identity check.
-    if(iid && self->iface_tag == COM_IFACE_IWDFDEVICE && guid_eq(iid, &g_iid_iwdf_usb_target_factory)) {
-        *out = get_usb_target_factory_facade((struct winwdf_device*) self->user_data);
-        return 0; //S_OK
-    }
-
     if(iid && self->iface_tag == COM_IFACE_IWDFDEVICE && guid_eq(iid, &g_iid_iwdf_property_store_factory)) {
         *out = get_property_store_factory_facade();
         return 0; //S_OK
@@ -168,9 +150,9 @@ static const char *g_stub_iface_name;
 //This generic stub returns S_OK (0) unconditionally, which is fine for the many void/no-out-param
 //methods that land here (SetLockingConstraint, SetPowerPolicyOwnership, etc.) and even for some
 //with out-params the driver doesn't treat as fatal on failure (CreateDeviceInterface/
-//AssignDeviceInterfaceState - tried making this stub return E_NOTIMPL uniformly at one point since
-//IWDFDevice3::MapIoSpace/CreateInterrupt crash when their out-param is left unset after a "success"
-//return, but that broke OnDeviceAdd entirely: it turns out the driver DOES treat
+//AssignDeviceInterfaceState - tried making this stub return E_NOTIMPL uniformly at one point, since
+//methods with out-params can't safely report success without filling them in, but that broke
+//OnDeviceAdd entirely: it turns out the driver DOES treat
 //CreateDeviceInterface's failure as fatal, aborting device add with the propagated E_NOTIMPL. So
 //S_OK stays the default here, and methods that are unsafe to no-op this way (MapIoSpace) get their
 //own explicit, real override instead (see device_obj's vtable setup in com_create_device) rather
@@ -417,20 +399,6 @@ __winfnc static void *com_request_complete_with_information(struct com_obj *self
     WdfRequestComplete(NULL, (WDFOBJECT) rd->req, (NTSTATUS) status);
     return 0;
 }
-//IWDFIoRequest::Send (slot 23, verified against wudfddi.h's raw flattened vtable struct) - needed
-//for the IWDFUsbTargetPipe bridge below: after FormatRequestForRead/Write configures a request
-//against a pipe/device target, the driver calls Send on the SAME request (not a method on the
-//target) to actually dispatch it. pIoTarget/Flags aren't used by this project's underlying
-//wdf_start_request/usb_transfer_start machinery (the target to operate on was already captured at
-//FormatRequest time), so they're accepted and ignored rather than needing a real IWDFIoTarget
-//implementation.
-__winfnc static HRESULT com_request_send(struct com_obj *self, void *io_target, ULONG flags, LONGLONG timeout) {
-    struct com_request_data *rd = (struct com_request_data*) self->user_data;
-    log_verbose("com_request_send self=%p req=%p io_target=%p flags=0x%x", self, rd->req, io_target, flags);
-    wdf_start_request(rd->req, NULL, -1);
-    return 0; //S_OK
-}
-
 typedef void __winfnc (*com_ondeviceiocontrol_fnc)(void *self, void *wdf_queue, void *wdf_request, ULONG code, size_t in_size, size_t out_size);
 
 //Bridges a real WDF devctrl dispatch (winapi/wdf/queue.c's wdf_queue_devctrl, itself reached via
@@ -477,20 +445,14 @@ __winfnc static void com_queue_evt_io_device_control(WDFOBJECT queue_obj, WDFOBJ
     req_facade->vtable[18] = com_request_get_input_memory;         //IWDFIoRequest::GetInputMemory
     req_facade->vtable[19] = com_request_mark_cancelable;          //IWDFIoRequest::MarkCancelable
     req_facade->vtable[20] = com_request_unmark_cancelable;        //IWDFIoRequest::UnmarkCancelable
-    req_facade->vtable[23] = com_request_send;                     //IWDFIoRequest::Send
 
     void **cb_vtable = *(void***) driver_callback;
     ((com_ondeviceiocontrol_fnc) cb_vtable[3])(driver_callback, queue_facade, req_facade, code, in_len, out_len);
 }
 
-//IWDFDevice::GetDefaultIoTarget - slot 11 per the same wudfddi.h vtable-counting as CreateIoQueue
-//below (RetrieveDevicePropertyStore=8, GetDriver=9, RetrieveDeviceInstanceId=10,
-//GetDefaultIoTarget=11). Never previously implemented, meaning any driver code calling this fell
-//through to the generic stub, which leaves *ppWdfIoTarget unset (a real out-param, not a harmless
-//void-returning hint like most of what lands on the generic stub) - a real caller would then be
-//holding garbage instead of a usable IWDFIoTarget*. Returns a persistent, generic-stub-backed
-//facade (same pattern as com_create_interrupt) so a caller at least gets a valid, safely-callable
-//object instead of garbage; every method on it still just logs and returns S_OK until identified.
+//IWDFDevice::GetDefaultIoTarget (slot 11, per wudfddi.h). Not called by this driver - it does its USB
+//I/O through WinUsb directly (coverage-checked). Implemented only so an unexpected call gets a valid,
+//generic-stub-backed IWDFIoTarget facade instead of an unset out-param.
 __winfnc static void com_get_default_io_target(struct com_obj *self, struct com_obj **out) {
     log_verbose("com_get_default_io_target ENTER self=%p", self);
     static struct com_obj *io_target_facade = NULL;
@@ -584,17 +546,10 @@ static struct com_obj *get_property_store_factory_facade(void) {
     return factory_facade;
 }
 
-//IWDFDevice::RetrieveDeviceInstanceId (slot 10, same wudfddi.h vtable-counting as the rest of this
-//interface). Found live tracing the "PairingContext" singleton constructor's own gate check (see
-//FINDINGS.md, COM bridge): it calls a generic
-//wildcard-match helper against the literal pattern `"usb"`, comparing it against a field of a
-//local struct this project has never populated - device_obj's own vtable slot 10 was still the
-//generic stub, so any driver code calling RetrieveDeviceInstanceId got an empty string back,
-//which can never match "usb", silently steering the driver down its non-USB
-//(vtable-population-skipped) construction path instead of the real one. Two-phase pattern like
-//RetrieveDeviceName above. Uses a plausible real device instance ID matching this exact
-//hardware's actual USB IDs (confirmed via this session's external research - a real `lsusb -v`
-//dump against genuine `06cb:0082` hardware, posted publicly against this exact PID).
+//IWDFDevice::RetrieveDeviceInstanceId (slot 10, per wudfddi.h). Not called by this driver in normal
+//operation (coverage-checked across open/enroll/identify/verify/close); implemented anyway because
+//the generic stub would return S_OK without filling in the out-params. Two-phase size query like
+//RetrieveDeviceName above, returning an instance ID shaped like the real one for 06cb:0082.
 #define FAKE_WDF_DEVICE_INSTANCE_ID "USB\\VID_06CB&PID_0082\\6&1a2b3c4d&0&1"
 __winfnc static HRESULT com_retrieve_device_instance_id(struct com_obj *self, char16_t *out_id, DWORD *out_len) {
     static char16_t *wid = NULL;
@@ -673,11 +628,9 @@ __winfnc static HRESULT com_retrieve_device_name(struct com_obj *self, char16_t 
 //and every subsequent device-control IOCTL (e.g. the sensor's Reset()) fails outright. Delegates to
 //the existing flat-table WdfIoQueueCreate, stashing the driver's own COM devctrl callback on the
 //resulting queue for com_queue_evt_io_device_control to use once real requests start arriving.
-//IWDFDevice3::MapIoSpace - explicit override (rather than relying on the shared generic-stub
-//default) because this one has a real out-parameter (**pPseudoBaseAddress) that a "success" return
-//promises is valid; a plain USB device never has real MMIO to map, so this fails outright rather
-//than the generic stub's blanket S_OK, which the driver would otherwise take as license to
-//dereference the (unset) pseudo-address and crash.
+//IWDFDevice3::MapIoSpace. Not called by this driver (coverage-checked); overridden only because the
+//generic stub's blanket S_OK would promise a valid **pPseudoBaseAddress it never sets. A USB device
+//has no MMIO to map, so this fails explicitly.
 __winfnc static HRESULT com_map_io_space(struct com_obj *self, uint64_t phys_addr, size_t num_bytes, ULONG cache_type, void **out) {
     return (HRESULT) 0x80004001; /* E_NOTIMPL */
 }
@@ -719,14 +672,11 @@ __winfnc static void *com_create_io_queue(struct com_obj *self, void *callback_i
     return (void*) (intptr_t) status;
 }
 
-//IWDFInterrupt - identified live: IWDFDevice3::CreateInterrupt (slot 40) failing with E_NOTIMPL left
-//the driver's own cached interrupt-object field (device context +0xd0, NULL from construction) unset,
-//and later code unconditionally called through it (vtable slot 17, TryToAcquireInterruptLock),
-//crashing on the NULL deref. This driver doesn't have a real line-based IRQ (it's a plain USB
-//device) - real WDF drivers commonly still create a WDF interrupt object purely to get its built-in
-//synchronization semantics (AcquireLock/ReleaseLock/TryToAcquireInterruptLock etc. around a
-//dedicated lock), so a working facade backed by a real mutex - not a real interrupt - is exactly
-//what's needed here, not actual interrupt wiring.
+//IWDFInterrupt, returned by IWDFDevice3::CreateInterrupt (slot 40). Not called by this driver in
+//normal operation (coverage-checked); implemented so an unexpected call gets a usable object rather
+//than the generic stub's S_OK with an unset out-param. A USB device has no line-based IRQ, so this is
+//just a mutex-backed object providing the AcquireLock/ReleaseLock/TryToAcquireInterruptLock
+//synchronization semantics WDF interrupt objects offer.
 struct com_interrupt_data {
     pthread_mutex_t lock;
     struct com_obj *device_obj;
@@ -784,145 +734,6 @@ __winfnc static void *com_create_interrupt(struct com_obj *self, void *config, s
 
     *out = obj;
     return 0; //S_OK
-}
-
-//IWDFUsbTargetFactory/Device/Interface/Pipe - the documented UMDF 1.x USB access chain (see
-//g_iid_iwdf_usb_target_factory above). Delegates to the already-working, libusb-backed flat-table
-//implementation in winapi/wdf/usb.c wherever possible (WdfUsbTargetDeviceCreate,
-//WdfUsbTargetDeviceGetInterface, WdfUsbInterfaceGetConfiguredPipe all take/return the exact same
-//WDFOBJECT-typed handles regardless of which activation model reaches them, so no translation
-//needed there); FormatRequestForRead/Write go through wdf_usb_pipe_format_request_for_{read,write}_raw
-//instead of the flat WdfUsbTargetPipeFormatRequestForRead/Write, since those expect a real
-//WDF_memory-shaped WDFOBJECT for pMemory, not one of this project's own IWDFMemory facades
-//(com_memory_data) - see winapi/wdf/usb.c's transfer_req_ctx comment.
-//
-//user_data on each of these facades is the raw flat-table object pointer directly (struct
-//wdf_usb_device*/wdf_usb_interface*/wdf_usb_pipe*) - no extra wrapper struct needed except for the
-//pipe facade, which also caches its own WDF_USB_PIPE_INFORMATION (filled in by
-//WdfUsbInterfaceGetConfiguredPipe at creation time) since GetInformation/IsInEndPoint/IsOutEndPoint/
-//GetType all just report fields from it.
-struct com_usb_pipe_data {
-    struct wdf_usb_pipe *usb_pipe;
-    WDF_USB_PIPE_INFORMATION info;
-};
-
-__winfnc static HRESULT com_usb_pipe_format_request_for_read(struct com_obj *self, struct com_obj *req_facade, struct com_obj *file_obj, struct com_obj *mem_facade, WDFMEMORY_OFFSET *mem_off, LONGLONG *device_offset) {
-    struct com_usb_pipe_data *pipe_data = (struct com_usb_pipe_data*) self->user_data;
-    struct com_request_data *rd = (struct com_request_data*) req_facade->user_data;
-    struct com_memory_data *mem = (struct com_memory_data*) mem_facade->user_data;
-
-    uint8_t *buf = (uint8_t*) mem->buf;
-    size_t buf_len = mem->size;
-    if(mem_off) { buf += mem_off->BufferOffset; buf_len = mem_off->BufferLength; }
-
-    log_verbose("com_usb_pipe_format_request_for_read self=%p req=%p buf=%p len=0x%zx", self, rd->req, (void*) buf, buf_len);
-    NTSTATUS status = wdf_usb_pipe_format_request_for_read_raw(pipe_data->usb_pipe, rd->req, buf, buf_len);
-    return (HRESULT) (intptr_t) status; //STATUS_SUCCESS (0) doubles as S_OK
-}
-__winfnc static HRESULT com_usb_pipe_format_request_for_write(struct com_obj *self, struct com_obj *req_facade, struct com_obj *file_obj, struct com_obj *mem_facade, WDFMEMORY_OFFSET *mem_off, LONGLONG *device_offset) {
-    struct com_usb_pipe_data *pipe_data = (struct com_usb_pipe_data*) self->user_data;
-    struct com_request_data *rd = (struct com_request_data*) req_facade->user_data;
-    struct com_memory_data *mem = (struct com_memory_data*) mem_facade->user_data;
-
-    uint8_t *buf = (uint8_t*) mem->buf;
-    size_t buf_len = mem->size;
-    if(mem_off) { buf += mem_off->BufferOffset; buf_len = mem_off->BufferLength; }
-
-    log_verbose("com_usb_pipe_format_request_for_write self=%p req=%p buf=%p len=0x%zx", self, rd->req, (void*) buf, buf_len);
-    NTSTATUS status = wdf_usb_pipe_format_request_for_write_raw(pipe_data->usb_pipe, rd->req, buf, buf_len);
-    return (HRESULT) (intptr_t) status;
-}
-//Real Windows WINUSB_PIPE_INFORMATION layout (a plain data struct the driver reads directly, not a
-//COM object) - matches winapi/winusb.c's own private copy, redeclared here to avoid a cross-file
-//dependency for four fields.
-typedef struct { UCHAR PipeType; UCHAR PipeId; USHORT MaximumPacketSize; UCHAR Interval; } COM_WINUSB_PIPE_INFORMATION;
-__winfnc static void com_usb_pipe_get_information(struct com_obj *self, COM_WINUSB_PIPE_INFORMATION *info_out) {
-    struct com_usb_pipe_data *pipe_data = (struct com_usb_pipe_data*) self->user_data;
-    *info_out = (COM_WINUSB_PIPE_INFORMATION) {
-        .PipeType = (UCHAR) pipe_data->info.PipeType, .PipeId = pipe_data->info.EndpointAddress,
-        .MaximumPacketSize = (USHORT) pipe_data->info.MaximumPacketSize, .Interval = pipe_data->info.Interval,
-    };
-}
-__winfnc static BOOL com_usb_pipe_is_in_endpoint(struct com_obj *self) {
-    return (((struct com_usb_pipe_data*) self->user_data)->info.EndpointAddress & 0x80) != 0;
-}
-__winfnc static BOOL com_usb_pipe_is_out_endpoint(struct com_obj *self) {
-    return (((struct com_usb_pipe_data*) self->user_data)->info.EndpointAddress & 0x80) == 0;
-}
-__winfnc static ULONG com_usb_pipe_get_type(struct com_obj *self) {
-    return (ULONG) ((struct com_usb_pipe_data*) self->user_data)->info.PipeType;
-}
-
-__winfnc static HRESULT com_usb_interface_retrieve_pipe(struct com_obj *self, UCHAR pipe_idx, struct com_obj **out) {
-    struct wdf_usb_interface *usb_if = (struct wdf_usb_interface*) self->user_data;
-
-    WDF_USB_PIPE_INFORMATION info = {0};
-    WDFOBJECT pipe_obj = WdfUsbInterfaceGetConfiguredPipe(NULL, (WDFOBJECT) usb_if, pipe_idx, &info);
-    log_verbose("com_usb_interface_retrieve_pipe self=%p pipe_idx=%d pipe_obj=%p", self, (int) pipe_idx, (void*) pipe_obj);
-    if(!pipe_obj) return (HRESULT) 0x80070057; /* E_INVALIDARG */
-
-    struct com_usb_pipe_data *pipe_data = (struct com_usb_pipe_data*) malloc(sizeof(struct com_usb_pipe_data));
-    pipe_data->usb_pipe = (struct wdf_usb_pipe*) pipe_obj;
-    pipe_data->info = info;
-
-    struct com_obj *pipe_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
-    make_com_obj(pipe_facade, pipe_data);
-    pipe_facade->vtable[10] = com_usb_pipe_format_request_for_read;  //IWDFUsbTargetPipe::FormatRequestForRead
-    pipe_facade->vtable[11] = com_usb_pipe_format_request_for_write; //IWDFUsbTargetPipe::FormatRequestForWrite
-    pipe_facade->vtable[16] = com_usb_pipe_get_information;          //IWDFUsbTargetPipe::GetInformation
-    pipe_facade->vtable[17] = com_usb_pipe_is_in_endpoint;           //IWDFUsbTargetPipe::IsInEndPoint
-    pipe_facade->vtable[18] = com_usb_pipe_is_out_endpoint;          //IWDFUsbTargetPipe::IsOutEndPoint
-    pipe_facade->vtable[19] = com_usb_pipe_get_type;                 //IWDFUsbTargetPipe::GetType
-
-    *out = pipe_facade;
-    return 0; //S_OK
-}
-
-__winfnc static UCHAR com_usb_device_get_num_interfaces(struct com_obj *self) {
-    return (UCHAR) wdf_usb_device_get_num_interfaces((struct wdf_usb_device*) self->user_data);
-}
-__winfnc static HRESULT com_usb_device_retrieve_interface(struct com_obj *self, UCHAR idx, struct com_obj **out) {
-    struct wdf_usb_device *usb_dev = (struct wdf_usb_device*) self->user_data;
-
-    WDFOBJECT if_obj = WdfUsbTargetDeviceGetInterface(NULL, (WDFOBJECT) usb_dev, idx);
-    log_verbose("com_usb_device_retrieve_interface self=%p idx=%d if_obj=%p", self, (int) idx, (void*) if_obj);
-    if(!if_obj) return (HRESULT) 0x80070057; /* E_INVALIDARG */
-
-    struct com_obj *if_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
-    make_com_obj(if_facade, if_obj);
-    if_facade->vtable[14] = com_usb_interface_retrieve_pipe; //IWDFUsbInterface::RetrieveUsbPipeObject
-
-    *out = if_facade;
-    return 0; //S_OK
-}
-
-__winfnc static HRESULT com_usb_factory_create_device(struct com_obj *self, struct com_obj **out) {
-    struct winwdf_device *device = (struct winwdf_device*) self->user_data;
-
-    WDF_DRIVER_GLOBALS globals = { .Driver = wdf_device_get_driver(device) };
-    WDFOBJECT usb_dev_obj;
-    NTSTATUS status = WdfUsbTargetDeviceCreate(&globals, (WDFOBJECT) device, NULL, &usb_dev_obj);
-    log_verbose("com_usb_factory_create_device self=%p status=0x%x usb_dev_obj=%p", self, status, (void*) usb_dev_obj);
-    if(status != 0) return (HRESULT) (intptr_t) status;
-
-    struct com_obj *dev_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
-    make_com_obj(dev_facade, usb_dev_obj);
-    dev_facade->vtable[14] = com_usb_device_get_num_interfaces;  //IWDFUsbTargetDevice::GetNumInterfaces
-    dev_facade->vtable[15] = com_usb_device_retrieve_interface;  //IWDFUsbTargetDevice::RetrieveUsbInterface
-
-    *out = dev_facade;
-    return 0; //S_OK
-}
-
-static struct com_obj *get_usb_target_factory_facade(struct winwdf_device *device) {
-    static struct com_obj *factory_facade = NULL;
-    if(!factory_facade) {
-        factory_facade = (struct com_obj*) malloc(sizeof(struct com_obj));
-        make_com_obj(factory_facade, device);
-        factory_facade->vtable[3] = com_usb_factory_create_device; //IWDFUsbTargetFactory::CreateUsbTargetDevice
-        log_verbose("created IWDFUsbTargetFactory facade %p for device %p", factory_facade, device);
-    }
-    return factory_facade;
 }
 
 //IWDFDevice::ConfigureRequestDispatching - identified live via the same vtable-math cross-reference
