@@ -26,8 +26,11 @@ StartCapture context by itself" onward) for what fixed it. Most of the
 history below documents workarounds for state the driver now sets up itself.
 Those workarounds are now disabled by default (`TUDOR_LEGACY_CTX_PATCH`).
 
-Not yet tested: rejecting a non-enrolled finger, identify from a store
-reloaded in a fresh process, and the libfprint/tudor-host path.
+Also verified, in a fresh process loading the saved data store (so
+persistence works): identify with the enrolled finger matched, identify with
+a different finger returned "no match", verify with the enrolled finger
+succeeded, and verify with a different finger failed. The matcher is real,
+not a shim artifact. Not yet tested: the libfprint/tudor-host path.
 
 ### Historical status (superseded)
 
